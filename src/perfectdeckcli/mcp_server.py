@@ -22,6 +22,161 @@ SyncMode = Literal["merge", "replace"]
 router: ProjectListingRouter | None = None
 mcp = FastMCP("perfectdeckcli_mcp")
 
+# ---------------------------------------------------------------------------
+# Store field reference & agent hints
+# ---------------------------------------------------------------------------
+
+_STORE_FIELD_LIMITS: dict[str, dict[str, int]] = {
+    "play": {"title": 30, "short_description": 80, "full_description": 4000},
+    "app_store": {"app_name": 30, "subtitle": 30, "description": 4000, "keywords": 100, "promotional_text": 170},
+}
+
+_TOOL_HINTS: dict[str, str] = {
+    "perfectdeck_get_element": (
+        "Use perfectdeck_set_element to update or perfectdeck_delete_element to remove."
+    ),
+    "perfectdeck_set_element": (
+        "Run perfectdeck_validate_listing to check character limits."
+    ),
+    "perfectdeck_delete_element": (
+        "Use perfectdeck_list_section to review remaining content."
+    ),
+    "perfectdeck_upsert_locale": (
+        "Run perfectdeck_validate_listing to check limits. "
+        "Call perfectdeck_mark_language_updated when translation is complete."
+    ),
+    "perfectdeck_list_section": (
+        "Use perfectdeck_set_element or perfectdeck_upsert_locale to modify. "
+        "Use perfectdeck_diff_listing to compare with another listing."
+    ),
+    "perfectdeck_list_apps": (
+        "Use perfectdeck_list_stores to see stores, or perfectdeck_list_section to read content."
+    ),
+    "perfectdeck_list_stores": (
+        "Use perfectdeck_list_languages for locales, or perfectdeck_list_section to read content."
+    ),
+    "perfectdeck_list_languages": (
+        "Use perfectdeck_add_language to add a locale, or perfectdeck_list_section to read content."
+    ),
+    "perfectdeck_diff_listing": (
+        "Use perfectdeck_sync_listing to copy from source to target."
+    ),
+    "perfectdeck_sync_listing": (
+        "Use perfectdeck_diff_listing to verify, or perfectdeck_validate_listing to check limits."
+    ),
+    "perfectdeck_init_from_existing": (
+        "Use perfectdeck_list_section to review cloned content. "
+        "Customize with perfectdeck_set_element or perfectdeck_upsert_locale."
+    ),
+    "perfectdeck_set_baseline_language": (
+        "Editing this locale now auto-bumps the version. "
+        "Use perfectdeck_get_update_status to check translation freshness."
+    ),
+    "perfectdeck_bump_version": (
+        "Non-baseline locales are now stale. Use perfectdeck_get_update_status to see which, "
+        "then perfectdeck_mark_language_updated after translating each."
+    ),
+    "perfectdeck_mark_language_updated": (
+        "Use perfectdeck_get_update_status to check remaining stale locales."
+    ),
+    "perfectdeck_get_update_status": (
+        "For stale locales: update with perfectdeck_upsert_locale, "
+        "then perfectdeck_mark_language_updated. To force a new version: perfectdeck_bump_version."
+    ),
+    "perfectdeck_save_snapshot": (
+        "Use perfectdeck_list_snapshots to see all versions, or perfectdeck_diff_snapshot to compare."
+    ),
+    "perfectdeck_list_snapshots": (
+        "Use perfectdeck_diff_snapshot to compare with current, or perfectdeck_restore_snapshot to roll back."
+    ),
+    "perfectdeck_restore_snapshot": (
+        "Use perfectdeck_list_section to review restored data."
+    ),
+    "perfectdeck_diff_snapshot": (
+        "Use perfectdeck_restore_snapshot to roll back if needed."
+    ),
+    "perfectdeck_set_release_notes": (
+        "Run perfectdeck_validate_release_notes to check limits (Play: 500, App Store: 4000)."
+    ),
+    "perfectdeck_upsert_release_notes": (
+        "Run perfectdeck_validate_release_notes to check limits."
+    ),
+    "perfectdeck_get_release_notes": (
+        "Use perfectdeck_set_release_notes to update one locale, "
+        "or perfectdeck_upsert_release_notes for batch updates."
+    ),
+    "perfectdeck_list_release_versions": (
+        "Use perfectdeck_get_release_notes to read, or perfectdeck_set_release_notes to add."
+    ),
+    "perfectdeck_delete_release_notes": (
+        "Use perfectdeck_list_release_versions to see remaining versions."
+    ),
+    "perfectdeck_validate_release_notes": (
+        "Fix errors with perfectdeck_set_release_notes or perfectdeck_upsert_release_notes."
+    ),
+    "perfectdeck_validate_listing": (
+        "Fix errors with perfectdeck_set_element or perfectdeck_upsert_locale."
+    ),
+    "perfectdeck_diff_play_listing": (
+        "Use perfectdeck_sync_play_listing to import remote, "
+        "or perfectdeck_push_play_listing to push local."
+    ),
+    "perfectdeck_diff_app_store_listing": (
+        "Use perfectdeck_sync_app_store_listing to import remote, "
+        "or perfectdeck_push_app_store_listing to push local."
+    ),
+    "perfectdeck_sync_play_listing": (
+        "Use perfectdeck_diff_play_listing to verify, or perfectdeck_validate_listing to check content."
+    ),
+    "perfectdeck_sync_app_store_listing": (
+        "Use perfectdeck_diff_app_store_listing to verify, or perfectdeck_validate_listing to check content."
+    ),
+    "perfectdeck_push_play_listing": (
+        "Use perfectdeck_diff_play_listing to verify the push."
+    ),
+    "perfectdeck_push_app_store_listing": (
+        "Use perfectdeck_diff_app_store_listing to verify the push."
+    ),
+    "perfectdeck_push_play_release_notes": (
+        "Release notes pushed to Play Store track."
+    ),
+    "perfectdeck_push_play_screenshots": (
+        "Screenshots uploaded to Google Play."
+    ),
+    "perfectdeck_publish_play_bundle": (
+        "Bundle uploaded. Track release status in Google Play Console."
+    ),
+    "perfectdeck_create_app_store_version": (
+        "Version created. Use perfectdeck_push_app_store_listing to upload content."
+    ),
+    "perfectdeck_push_app_store_screenshots": (
+        "Screenshots uploaded to App Store Connect."
+    ),
+    "perfectdeck_sync_app_store_iap": (
+        "IAP localizations synced to App Store Connect."
+    ),
+    "perfectdeck_sync_app_store_subscriptions": (
+        "Subscription localizations synced to App Store Connect."
+    ),
+    "perfectdeck_sync_play_products": (
+        "Products synced to Google Play."
+    ),
+    "perfectdeck_sync_play_pricing": (
+        "Regional pricing applied on Google Play."
+    ),
+    "perfectdeck_sync_play_subscription_pricing": (
+        "Subscription pricing applied on Google Play."
+    ),
+}
+
+
+def _result(data: dict[str, Any], tool_name: str = "") -> str:
+    """Serialize result and attach a contextual hint for the calling agent."""
+    hint = _TOOL_HINTS.get(tool_name)
+    if hint and "hint" not in data:
+        data["hint"] = hint
+    return json.dumps(data, ensure_ascii=False)
+
 
 def _router() -> ProjectListingRouter:
     if router is None:
@@ -604,7 +759,7 @@ def perfectdeck_get_element(params: GetElementInput) -> str:
         key_path=params.key,
         locale=params.locale,
     )
-    return json.dumps({"ok": True, "value": result}, ensure_ascii=False)
+    return _result({"ok": True, "value": result}, "perfectdeck_get_element")
 
 
 @mcp.tool(
@@ -639,7 +794,7 @@ def perfectdeck_set_element(params: SetElementInput) -> str:
         value=params.value,
         locale=params.locale,
     )
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_set_element")
 
 
 @mcp.tool(
@@ -667,7 +822,7 @@ def perfectdeck_delete_element(params: DeleteElementInput) -> str:
         key_path=params.key,
         locale=params.locale,
     )
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_delete_element")
 
 
 @mcp.tool(
@@ -700,7 +855,7 @@ def perfectdeck_upsert_locale(params: UpsertLocaleInput) -> str:
         data=params.data,
         replace=params.replace,
     )
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_upsert_locale")
 
 
 @mcp.tool(
@@ -747,9 +902,9 @@ def perfectdeck_list_section(params: ListSectionInput) -> str:
                 {"ok": False, "error": f"Invalid jq expression: {exc}"},
                 ensure_ascii=False,
             )
-        return json.dumps({"ok": True, "data": result}, ensure_ascii=False)
+        return _result({"ok": True, "data": result}, "perfectdeck_list_section")
 
-    return json.dumps({"ok": True, "data": out}, ensure_ascii=False)
+    return _result({"ok": True, "data": out}, "perfectdeck_list_section")
 
 
 @mcp.tool(
@@ -779,7 +934,19 @@ def perfectdeck_init_listing(params: InitListingInput) -> str:
         baseline_locale=params.baseline_locale,
         overwrite=params.overwrite,
     )
-    return json.dumps(out, ensure_ascii=False)
+    initialized = out.get("initialized_stores", [])
+    out["store_fields"] = {s: _STORE_FIELD_LIMITS[s] for s in initialized if s in _STORE_FIELD_LIMITS}
+    parts = []
+    for s in initialized:
+        lim = _STORE_FIELD_LIMITS.get(s)
+        if lim:
+            label = "Play Store" if s == "play" else "App Store"
+            parts.append(f"{label}: {', '.join(f'{k} ({v})' for k, v in lim.items())}")
+    out["hint"] = (
+        "Listing created. Populate with perfectdeck_upsert_locale (batch) or "
+        "perfectdeck_set_element (single field). " + " | ".join(parts)
+    )
+    return _result(out, "perfectdeck_init_listing")
 
 
 @mcp.tool(
@@ -798,7 +965,7 @@ def perfectdeck_list_apps(params: ProjectInput) -> str:
     Returns: {"ok": true, "apps": ["myapp", "prod", ...]}
     """
     service = _router().service_for(params.project_path)
-    return json.dumps({"ok": True, "apps": service.list_apps()}, ensure_ascii=False)
+    return _result({"ok": True, "apps": service.list_apps()}, "perfectdeck_list_apps")
 
 
 @mcp.tool(
@@ -817,7 +984,7 @@ def perfectdeck_list_stores(params: ListStoresInput) -> str:
     Returns: {"ok": true, "stores": ["app_store", "play"]}
     """
     service = _router().service_for(params.project_path)
-    return json.dumps({"ok": True, "stores": service.list_stores(params.app)}, ensure_ascii=False)
+    return _result({"ok": True, "stores": service.list_stores(params.app)}, "perfectdeck_list_stores")
 
 
 @mcp.tool(
@@ -836,9 +1003,9 @@ def perfectdeck_list_languages(params: ListLanguagesInput) -> str:
     Returns: {"ok": true, "languages": ["en-US", "fr-FR", ...]}
     """
     service = _router().service_for(params.project_path)
-    return json.dumps(
+    return _result(
         {"ok": True, "languages": service.list_languages(app=params.app, store=params.store)},
-        ensure_ascii=False,
+        "perfectdeck_list_languages",
     )
 
 
@@ -858,7 +1025,7 @@ def perfectdeck_add_language(params: AddLanguageInput) -> str:
     Optionally copy initial content from an existing locale using copy_from_locale.
     After adding, use set_element or upsert_locale to customize the content.
 
-    Returns: {"ok": true, "created": true/false, "locale": "fr-FR", "current_fields": [...], "guide": {...}}
+    Returns: {"ok": true, "created": true/false, "locale": "...", "store_fields": {...}, "missing_fields": [...]}
     """
     service = _router().service_for(params.project_path)
     out = service.add_language(
@@ -869,70 +1036,28 @@ def perfectdeck_add_language(params: AddLanguageInput) -> str:
         overwrite=params.overwrite,
     )
 
-    # Gather contextual info for the agent
+    # Contextual info for the agent
     locale_data = service.list_section(app=params.app, store=params.store, locale=params.locale)
     current_fields = sorted(locale_data.keys()) if isinstance(locale_data, dict) else []
-    all_languages = service.list_languages(app=params.app, store=params.store)
+    limits = _STORE_FIELD_LIMITS.get(params.store, {})
 
     out["current_fields"] = current_fields
-    out["all_languages"] = all_languages
-    out["guide"] = _add_language_guide(params.store, current_fields, params.copy_from_locale)
+    out["all_languages"] = service.list_languages(app=params.app, store=params.store)
+    out["store_fields"] = limits
+    out["missing_fields"] = [f for f in limits if f not in current_fields]
 
-    return json.dumps(out, ensure_ascii=False)
-
-
-def _add_language_guide(
-    store: StoreName,
-    current_fields: list[str],
-    copied_from: str | None,
-) -> dict[str, Any]:
-    """Build contextual guidance for the agent after adding a language."""
-    if store == "play":
-        fields = {
-            "title": {"max_length": 30, "required": True, "description": "App name shown on Google Play"},
-            "short_description": {"max_length": 80, "required": True, "description": "Brief tagline shown in search results"},
-            "full_description": {"max_length": 4000, "required": True, "description": "Full app description on the listing page"},
-        }
-    else:
-        fields = {
-            "app_name": {"max_length": 30, "required": True, "description": "App name on the App Store"},
-            "subtitle": {"max_length": 30, "required": True, "description": "Brief tagline shown below the app name"},
-            "description": {"max_length": 4000, "required": True, "description": "Full app description"},
-            "keywords": {"max_length": 100, "required": True, "description": "Comma-separated search keywords"},
-            "promotional_text": {"max_length": 170, "required": False, "description": "Promotional text (can be updated without a new version)"},
-        }
-
-    missing_fields = [f for f in fields if f not in current_fields]
-
-    next_steps: list[str] = []
-    if copied_from:
-        next_steps.append(
-            f"Content was copied from '{copied_from}'. Translate each field to the target language."
-        )
-        next_steps.append(
-            "Use perfectdeck_upsert_locale to update all fields at once, "
-            "or perfectdeck_set_element to update one field at a time."
-        )
-    elif missing_fields:
-        next_steps.append(
-            "The locale is empty. Populate it using perfectdeck_upsert_locale (batch) "
-            "or perfectdeck_set_element (one field at a time)."
+    if params.copy_from_locale:
+        out["hint"] = (
+            f"Content copied from '{params.copy_from_locale}'. Translate each field, "
+            "then perfectdeck_mark_language_updated. Validate with perfectdeck_validate_listing."
         )
     else:
-        next_steps.append("All expected fields are present. Review and update as needed.")
+        out["hint"] = (
+            "Locale is empty. Use perfectdeck_upsert_locale (batch) or perfectdeck_set_element "
+            "(single field). Validate with perfectdeck_validate_listing."
+        )
 
-    next_steps.append(
-        "After populating content, run perfectdeck_validate_listing to check character limits."
-    )
-    next_steps.append(
-        "When translation is complete, call perfectdeck_mark_language_updated to clear the 'stale' flag."
-    )
-
-    return {
-        "store_fields": fields,
-        "missing_fields": missing_fields,
-        "next_steps": next_steps,
-    }
+    return _result(out, "perfectdeck_add_language")
 
 
 @mcp.tool(
@@ -967,7 +1092,7 @@ def perfectdeck_diff_listing(params: DiffListingInput) -> str:
     )
     diff = diff_objects(left, right)
     diff["same"] = not diff["added"] and not diff["removed"] and not diff["changed"]
-    return json.dumps({"ok": True, "diff": diff}, ensure_ascii=False)
+    return _result({"ok": True, "diff": diff}, "perfectdeck_diff_listing")
 
 
 @mcp.tool(
@@ -1002,14 +1127,14 @@ def perfectdeck_sync_listing(params: SyncListingInput) -> str:
         locale=params.locale,
         merge=(params.mode == "merge"),
     )
-    return json.dumps(
+    return _result(
         {
             "ok": bool(out.get("ok")),
             "source_project_path": params.source_project_path,
             "target_project_path": params.target_project_path,
             "mode": params.mode,
         },
-        ensure_ascii=False,
+        "perfectdeck_sync_listing",
     )
 
 
@@ -1046,7 +1171,7 @@ def perfectdeck_init_from_existing(params: InitFromExistingInput) -> str:
         locales=params.locales,
         baseline_locale=params.baseline_locale,
     )
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_init_from_existing")
 
 
 @mcp.tool(
@@ -1069,7 +1194,7 @@ def perfectdeck_set_baseline_language(params: SetBaselineLanguageInput) -> str:
     """
     service = _router().service_for(params.project_path)
     out = service.set_baseline_locale(app=params.app, store=params.store, locale=params.locale)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_set_baseline_language")
 
 
 @mcp.tool(
@@ -1098,7 +1223,7 @@ def perfectdeck_bump_version(params: BumpVersionInput) -> str:
         reason=params.reason,
         source_locale=params.source_locale,
     )
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_bump_version")
 
 
 @mcp.tool(
@@ -1120,7 +1245,7 @@ def perfectdeck_mark_language_updated(params: MarkLanguageUpdatedInput) -> str:
     """
     service = _router().service_for(params.project_path)
     out = service.mark_language_updated(app=params.app, store=params.store, locale=params.locale)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_mark_language_updated")
 
 
 @mcp.tool(
@@ -1143,7 +1268,7 @@ def perfectdeck_get_update_status(params: VersioningInput) -> str:
     """
     service = _router().service_for(params.project_path)
     out = service.get_update_status(app=params.app, store=params.store)
-    return json.dumps({"ok": True, "status": out}, ensure_ascii=False)
+    return _result({"ok": True, "status": out}, "perfectdeck_get_update_status")
 
 
 @mcp.tool(
@@ -1167,7 +1292,7 @@ def perfectdeck_save_snapshot(params: SaveSnapshotInput) -> str:
     """
     service = _router().service_for(params.project_path)
     out = service.save_snapshot(app=params.app, store=params.store, reason=params.reason)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_save_snapshot")
 
 
 @mcp.tool(
@@ -1187,7 +1312,7 @@ def perfectdeck_list_snapshots(params: VersioningInput) -> str:
     """
     service = _router().service_for(params.project_path)
     snapshots = service.list_snapshots(app=params.app, store=params.store)
-    return json.dumps({"ok": True, "snapshots": snapshots}, ensure_ascii=False)
+    return _result({"ok": True, "snapshots": snapshots}, "perfectdeck_list_snapshots")
 
 
 @mcp.tool(
@@ -1210,7 +1335,7 @@ def perfectdeck_restore_snapshot(params: SnapshotInput) -> str:
     """
     service = _router().service_for(params.project_path)
     out = service.restore_snapshot(app=params.app, store=params.store, version=params.version)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_restore_snapshot")
 
 
 @mcp.tool(
@@ -1233,7 +1358,7 @@ def perfectdeck_diff_snapshot(params: SnapshotInput) -> str:
     """
     service = _router().service_for(params.project_path)
     out = service.diff_with_snapshot(app=params.app, store=params.store, version=params.version)
-    return json.dumps({"ok": True, **out}, ensure_ascii=False)
+    return _result({"ok": True, **out}, "perfectdeck_diff_snapshot")
 
 
 def _fetch_play_remote(
@@ -1319,7 +1444,7 @@ def perfectdeck_diff_play_listing(params: FetchPlayListingInput) -> str:
     out = service.diff_with_play_store_data(app=params.app, data=locales_data)
     out["fetched_locales"] = sorted(locales_data.keys())
     _persist_play_credentials(params.project_path, params.app, pkg, creds)
-    return json.dumps({"ok": True, **out}, ensure_ascii=False)
+    return _result({"ok": True, **out}, "perfectdeck_diff_play_listing")
 
 
 @mcp.tool(
@@ -1343,7 +1468,7 @@ def perfectdeck_diff_app_store_listing(params: FetchAppStoreListingInput) -> str
     out = service.diff_with_app_store_data(app=params.app, data=locales_data)
     out["fetched_locales"] = sorted(locales_data.keys())
     _persist_app_store_credentials(params.project_path, params.app, r_app_id, r_key_id, r_issuer_id, r_pk)
-    return json.dumps({"ok": True, **out}, ensure_ascii=False)
+    return _result({"ok": True, **out}, "perfectdeck_diff_app_store_listing")
 
 
 @mcp.tool(
@@ -1378,7 +1503,7 @@ def perfectdeck_sync_play_listing(params: FetchPlayListingInput) -> str:
     if subscriptions_data:
         out["subscriptions_count"] = len(subscriptions_data)
     _persist_play_credentials(params.project_path, params.app, pkg, creds)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_sync_play_listing")
 
 
 @mcp.tool(
@@ -1415,7 +1540,7 @@ def perfectdeck_sync_app_store_listing(params: FetchAppStoreListingInput) -> str
     if subscriptions_data:
         out["subscriptions_count"] = len(subscriptions_data)
     _persist_app_store_credentials(params.project_path, params.app, r_app_id, r_key_id, r_issuer_id, r_pk)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_sync_app_store_listing")
 
 
 # ======================================================================
@@ -1449,7 +1574,7 @@ def perfectdeck_set_release_notes(params: SetReleaseNotesInput) -> str:
         locale=params.locale,
         text=params.text,
     )
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_set_release_notes")
 
 
 @mcp.tool(
@@ -1477,7 +1602,7 @@ def perfectdeck_upsert_release_notes(params: UpsertReleaseNotesInput) -> str:
         app_version=params.app_version,
         data=params.data,
     )
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_upsert_release_notes")
 
 
 @mcp.tool(
@@ -1505,7 +1630,7 @@ def perfectdeck_get_release_notes(params: GetReleaseNotesInput) -> str:
         app_version=params.app_version,
         locale=params.locale,
     )
-    return json.dumps({"ok": True, **out}, ensure_ascii=False)
+    return _result({"ok": True, **out}, "perfectdeck_get_release_notes")
 
 
 @mcp.tool(
@@ -1525,7 +1650,7 @@ def perfectdeck_list_release_versions(params: ListReleaseVersionsInput) -> str:
     """
     service = _router().service_for(params.project_path)
     versions = service.list_release_versions(app=params.app, store=params.store)
-    return json.dumps({"ok": True, "versions": versions}, ensure_ascii=False)
+    return _result({"ok": True, "versions": versions}, "perfectdeck_list_release_versions")
 
 
 @mcp.tool(
@@ -1551,7 +1676,7 @@ def perfectdeck_delete_release_notes(params: DeleteReleaseNotesInput) -> str:
         store=params.store,
         app_version=params.app_version,
     )
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_delete_release_notes")
 
 
 @mcp.tool(
@@ -1579,7 +1704,7 @@ def perfectdeck_validate_release_notes(params: ValidateReleaseNotesInput) -> str
         store=params.store,
         app_version=params.app_version,
     )
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_validate_release_notes")
 
 
 # ======================================================================
@@ -1612,7 +1737,7 @@ def perfectdeck_validate_listing(params: ValidateListingInput) -> str:
     out = service.validate_listing(
         app=params.app, store=params.store, locales=params.locales,
     )
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_validate_listing")
 
 
 # ======================================================================
@@ -1654,7 +1779,7 @@ def perfectdeck_push_play_listing(params: PushPlayListingInput) -> str:
         version_code=params.version_code,
     )
     _persist_play_credentials(params.project_path, params.app, pkg, creds)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_push_play_listing")
 
 
 @mcp.tool(
@@ -1687,7 +1812,7 @@ def perfectdeck_push_play_release_notes(params: PushPlayReleaseNotesInput) -> st
         release_notes=release_notes,
     )
     _persist_play_credentials(params.project_path, params.app, pkg, creds)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_push_play_release_notes")
 
 
 @mcp.tool(
@@ -1719,7 +1844,7 @@ def perfectdeck_push_play_screenshots(params: PushPlayScreenshotsInput) -> str:
     )
     if params.app:
         _persist_play_credentials(params.project_path, params.app, pkg, creds)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_push_play_screenshots")
 
 
 @mcp.tool(
@@ -1755,7 +1880,7 @@ def perfectdeck_publish_play_bundle(params: PublishPlayBundleInput) -> str:
         mapping_path=params.mapping_path,
     )
     _persist_play_credentials(params.project_path, params.app, pkg, creds)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_publish_play_bundle")
 
 
 @mcp.tool(
@@ -1784,7 +1909,7 @@ def perfectdeck_sync_play_products(params: SyncPlayProductsInput) -> str:
     )
     if params.app:
         _persist_play_credentials(params.project_path, params.app, pkg, creds)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_sync_play_products")
 
 
 @mcp.tool(
@@ -1814,7 +1939,7 @@ def perfectdeck_sync_play_pricing(params: SyncPlayPricingInput) -> str:
     )
     if params.app:
         _persist_play_credentials(params.project_path, params.app, pkg, creds)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_sync_play_pricing")
 
 
 @mcp.tool(
@@ -1845,7 +1970,7 @@ def perfectdeck_sync_play_subscription_pricing(params: SyncPlaySubscriptionPrici
     )
     if params.app:
         _persist_play_credentials(params.project_path, params.app, pkg, creds)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_sync_play_subscription_pricing")
 
 
 # ======================================================================
@@ -1889,7 +2014,7 @@ def perfectdeck_push_app_store_listing(params: PushAppStoreListingInput) -> str:
         only_whats_new=params.only_whats_new,
     )
     _persist_app_store_credentials(params.project_path, params.app, r_app_id, r_key_id, r_issuer_id, r_pk)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_push_app_store_listing")
 
 
 @mcp.tool(
@@ -1927,7 +2052,7 @@ def perfectdeck_create_app_store_version(params: CreateAppStoreVersionInput) -> 
     out["ok"] = True
     if params.app:
         _persist_app_store_credentials(params.project_path, params.app, r_app_id, r_key_id, r_issuer_id, r_pk)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_create_app_store_version")
 
 
 @mcp.tool(
@@ -1973,7 +2098,7 @@ def perfectdeck_push_app_store_screenshots(params: PushAppStoreScreenshotsInput)
     )
     if params.app:
         _persist_app_store_credentials(params.project_path, params.app, r_app_id, r_key_id, r_issuer_id, r_pk)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_push_app_store_screenshots")
 
 
 @mcp.tool(
@@ -2008,7 +2133,7 @@ def perfectdeck_sync_app_store_iap(params: SyncAppStoreIapInput) -> str:
     )
     if params.app:
         _persist_app_store_credentials(params.project_path, params.app, r_app_id, r_key_id, r_issuer_id, r_pk)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_sync_app_store_iap")
 
 
 @mcp.tool(
@@ -2043,7 +2168,7 @@ def perfectdeck_sync_app_store_subscriptions(params: SyncAppStoreSubscriptionsIn
     )
     if params.app:
         _persist_app_store_credentials(params.project_path, params.app, r_app_id, r_key_id, r_issuer_id, r_pk)
-    return json.dumps(out, ensure_ascii=False)
+    return _result(out, "perfectdeck_sync_app_store_subscriptions")
 
 
 def main() -> None:
