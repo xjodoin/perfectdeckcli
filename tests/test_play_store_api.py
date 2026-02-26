@@ -638,6 +638,76 @@ class TestEnsureManagedProducts:
         ])
         assert result["ok"] is True
 
+    def test_pricing_updates_legacy_base_and_default_purchase_options(self):
+        svc = _mock_service()
+        monetization = svc.monetization.return_value
+        monetization.onetimeproducts.return_value.get.return_value.execute.return_value = {
+            "purchaseOptions": [
+                {
+                    "purchaseOptionId": "legacy-base",
+                    "regionalPricingAndAvailabilityConfigs": [
+                        {
+                            "regionCode": "FR",
+                            "price": {"currencyCode": "EUR", "units": "1", "nanos": 990000000},
+                            "availability": "AVAILABLE",
+                        }
+                    ],
+                },
+                {
+                    "purchaseOptionId": "default",
+                    "regionalPricingAndAvailabilityConfigs": [
+                        {
+                            "regionCode": "DE",
+                            "price": {"currencyCode": "EUR", "units": "2", "nanos": 990000000},
+                            "availability": "AVAILABLE",
+                        }
+                    ],
+                },
+            ]
+        }
+
+        ensure_managed_products(svc, "com.example.app", [
+            {
+                "sku": "credits_3",
+                "default_price": {"currency": "USD", "price": 2.99},
+                "listings": {},
+                "pricing": {"US": {"currency": "USD", "price": 2.99}},
+            }
+        ])
+
+        patch_kwargs = monetization.onetimeproducts.return_value.patch.call_args.kwargs
+        purchase_options = patch_kwargs["body"]["purchaseOptions"]
+        by_id = {po["purchaseOptionId"]: po for po in purchase_options}
+        assert {"legacy-base", "default"}.issubset(by_id.keys())
+
+        legacy_regions = {
+            cfg["regionCode"]: cfg for cfg in by_id["legacy-base"]["regionalPricingAndAvailabilityConfigs"]
+        }
+        default_regions = {
+            cfg["regionCode"]: cfg for cfg in by_id["default"]["regionalPricingAndAvailabilityConfigs"]
+        }
+        assert legacy_regions["US"]["price"]["currencyCode"] == "USD"
+        assert default_regions["US"]["price"]["currencyCode"] == "USD"
+        assert "FR" in legacy_regions
+        assert "DE" in default_regions
+
+    def test_pricing_creates_legacy_base_and_default_when_missing(self):
+        svc = _mock_service()
+        monetization = svc.monetization.return_value
+
+        ensure_managed_products(svc, "com.example.app", [
+            {
+                "sku": "credits_3",
+                "default_price": {"currency": "USD", "price": 2.99},
+                "listings": {},
+            }
+        ])
+
+        patch_kwargs = monetization.onetimeproducts.return_value.patch.call_args.kwargs
+        purchase_options = patch_kwargs["body"]["purchaseOptions"]
+        po_ids = {po["purchaseOptionId"] for po in purchase_options}
+        assert po_ids == {"legacy-base", "default"}
+
 
 # ======================================================================
 # apply_regional_pricing
@@ -659,6 +729,62 @@ class TestApplyRegionalPricing:
         svc = _mock_service()
         result = apply_regional_pricing(svc, "com.example.app", "credits_3", {})
         assert result["regions_applied"] == 0
+
+    def test_updates_legacy_base_and_default_purchase_options(self):
+        svc = _mock_service()
+        monetization = svc.monetization.return_value
+        monetization.onetimeproducts.return_value.get.return_value.execute.return_value = {
+            "purchaseOptions": [
+                {
+                    "purchaseOptionId": "legacy-base",
+                    "regionalPricingAndAvailabilityConfigs": [
+                        {"regionCode": "GB", "price": {"currencyCode": "GBP", "units": "1", "nanos": 790000000}},
+                    ],
+                },
+                {
+                    "purchaseOptionId": "default",
+                    "regionalPricingAndAvailabilityConfigs": [
+                        {"regionCode": "AU", "price": {"currencyCode": "AUD", "units": "2", "nanos": 490000000}},
+                    ],
+                },
+            ]
+        }
+
+        apply_regional_pricing(
+            svc, "com.example.app", "credits_3",
+            {"US": {"currency": "USD", "price": 2.99}},
+        )
+
+        patch_kwargs = monetization.onetimeproducts.return_value.patch.call_args.kwargs
+        purchase_options = patch_kwargs["body"]["purchaseOptions"]
+        by_id = {po["purchaseOptionId"]: po for po in purchase_options}
+        assert {"legacy-base", "default"}.issubset(by_id.keys())
+
+        legacy_regions = {
+            cfg["regionCode"]: cfg for cfg in by_id["legacy-base"]["regionalPricingAndAvailabilityConfigs"]
+        }
+        default_regions = {
+            cfg["regionCode"]: cfg for cfg in by_id["default"]["regionalPricingAndAvailabilityConfigs"]
+        }
+        assert legacy_regions["US"]["price"]["currencyCode"] == "USD"
+        assert default_regions["US"]["price"]["currencyCode"] == "USD"
+        assert "GB" in legacy_regions
+        assert "AU" in default_regions
+
+    def test_creates_legacy_base_and_default_when_missing_purchase_options(self):
+        svc = _mock_service()
+        monetization = svc.monetization.return_value
+        monetization.onetimeproducts.return_value.get.return_value.execute.return_value = {}
+
+        apply_regional_pricing(
+            svc, "com.example.app", "credits_3",
+            {"US": {"currency": "USD", "price": 2.99}},
+        )
+
+        patch_kwargs = monetization.onetimeproducts.return_value.patch.call_args.kwargs
+        purchase_options = patch_kwargs["body"]["purchaseOptions"]
+        po_ids = {po["purchaseOptionId"] for po in purchase_options}
+        assert po_ids == {"legacy-base", "default"}
 
 
 # ======================================================================
