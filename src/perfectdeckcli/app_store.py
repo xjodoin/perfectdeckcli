@@ -171,6 +171,22 @@ class AppStoreConnectClient:
             raise RuntimeError(f"App Store Connect API error {status}: {response.text}")
 
     # ------------------------------------------------------------------
+    # App lookup
+    # ------------------------------------------------------------------
+
+    def find_app_id_by_bundle_id(self, bundle_id: str) -> str | None:
+        """Return the numeric App Store app ID for the given bundle ID, or None if not found."""
+        data = self.request(
+            "GET",
+            "/apps",
+            params={"filter[bundleId]": bundle_id, "fields[apps]": "bundleId,name", "limit": "5"},
+        )
+        items = data.get("data", [])
+        if not items:
+            return None
+        return items[0]["id"]
+
+    # ------------------------------------------------------------------
     # App info ID resolution
     # ------------------------------------------------------------------
 
@@ -729,6 +745,201 @@ class AppStoreConnectClient:
         )
 
     # ------------------------------------------------------------------
+    # Pricing — price point lookup helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_price_points_paginated(
+        self, path: str, territories: List[str] | None = None,
+    ) -> Dict[str, Dict[str, float]]:
+        """Fetch all price points from a paginated endpoint.
+
+        Returns ``{territory_id: {price_point_id: customer_price_float}}``.
+        Works for both IAP (``inAppPurchasePricePoints``) and subscription
+        (``subscriptionPricePoints``) endpoints.
+        """
+        base_domain = self.base_url.rsplit("/v", 1)[0]
+        params: Dict[str, str] | None = {"include": "territory", "limit": "200"}
+        if territories:
+            params["filter[territory]"] = ",".join(territories)
+
+        all_data: List[Dict[str, Any]] = []
+        all_included: List[Dict[str, Any]] = []
+        current_path: str | None = path
+        while current_path:
+            resp = self.request("GET", current_path, params=params)
+            all_data.extend(resp.get("data", []))
+            all_included.extend(resp.get("included", []))
+            next_link = resp.get("links", {}).get("next")
+            if next_link and isinstance(next_link, str) and next_link.startswith(base_domain):
+                current_path = next_link[len(base_domain):]
+                params = None
+            else:
+                break
+
+        result: Dict[str, Dict[str, float]] = {}
+        for pp in all_data:
+            pp_id = pp.get("id")
+            attrs = pp.get("attributes", {})
+            customer_price_str = attrs.get("customerPrice", "")
+            territory_id = pp.get("relationships", {}).get("territory", {}).get("data", {}).get("id", "")
+            if not pp_id or not customer_price_str or not territory_id:
+                continue
+            try:
+                customer_price = float(customer_price_str)
+            except (ValueError, TypeError):
+                continue
+            result.setdefault(territory_id, {})[pp_id] = customer_price
+        return result
+
+    def set_iap_pricing(
+        self,
+        iap_id: str,
+        pricing: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Set IAP pricing via a price schedule.
+
+        *pricing* maps ``{territory_3letter: {currency, price}}``.
+
+        Fetches available price points, snaps each requested price to the
+        nearest valid point per territory, then POSTs a new price schedule
+        (which replaces any existing one for this IAP).
+
+        Returns ``{"territories_set": int, "territories_skipped": [...], "not_found": [...]}``.
+        """
+        territories = list(pricing.keys())
+        price_points = self._fetch_price_points_paginated(
+            f"/v2/inAppPurchases/{iap_id}/pricePoints",
+            territories=territories,
+        )
+
+        included: List[Dict[str, Any]] = []
+        manual_price_refs: List[Dict[str, str]] = []
+        not_found: List[str] = []
+
+        for i, (territory, price_info) in enumerate(pricing.items()):
+            target_price = float(price_info.get("price", 0))
+            territory_points = price_points.get(territory)
+            if not territory_points:
+                not_found.append(territory)
+                continue
+            best_pp_id = min(territory_points, key=lambda pp: abs(territory_points[pp] - target_price))
+            client_id = f"${{{i}}}"  # format required by API: ${0}, ${1}, ...
+            manual_price_refs.append({"type": "inAppPurchasePrices", "id": client_id})
+            included.append({
+                "id": client_id,
+                "type": "inAppPurchasePrices",
+                "attributes": {"startDate": None},
+                "relationships": {
+                    "inAppPurchasePricePoint": {
+                        "data": {"type": "inAppPurchasePricePoints", "id": best_pp_id},
+                    },
+                },
+            })
+
+        if not included:
+            return {"territories_set": 0, "territories_skipped": not_found}
+
+        self.request(
+            "POST",
+            "/inAppPurchasePriceSchedules",
+            json_body={
+                "data": {
+                    "type": "inAppPurchasePriceSchedules",
+                    "relationships": {
+                        "inAppPurchase": {
+                            "data": {"type": "inAppPurchases", "id": iap_id},
+                        },
+                        "baseTerritory": {
+                            "data": {"type": "territories", "id": "USA"},
+                        },
+                        "manualPrices": {"data": manual_price_refs},
+                    },
+                },
+                "included": included,
+            },
+        )
+        return {"territories_set": len(included), "territories_skipped": not_found}
+
+    def set_subscription_pricing(
+        self,
+        subscription_id: str,
+        pricing: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Set subscription pricing for specified territories.
+
+        *pricing* maps ``{territory_3letter: {currency, price}}``.
+
+        Fetches available price points, snaps each requested price, then
+        replaces existing prices for those territories (DELETE then POST).
+
+        Returns ``{"territories_set": int, "territories_skipped": [...]}``.
+        """
+        territories = list(pricing.keys())
+        price_points = self._fetch_price_points_paginated(
+            f"/v1/subscriptions/{subscription_id}/pricePoints",
+            territories=territories,
+        )
+
+        # Fetch existing prices so we can delete them first
+        existing_resp = self.request(
+            "GET",
+            f"/v1/subscriptions/{subscription_id}/prices",
+            params={"include": "subscriptionPricePoint,territory", "limit": "200"},
+        )
+        existing_by_territory: Dict[str, str] = {}  # territory_id → price resource id
+        for item in existing_resp.get("data", []):
+            price_id = item.get("id")
+            territory_id = (
+                item.get("relationships", {})
+                .get("territory", {})
+                .get("data", {})
+                .get("id", "")
+            )
+            if price_id and territory_id:
+                existing_by_territory[territory_id] = price_id
+
+        set_count = 0
+        not_found: List[str] = []
+
+        for territory, price_info in pricing.items():
+            target_price = float(price_info.get("price", 0))
+            territory_points = price_points.get(territory)
+            if not territory_points:
+                not_found.append(territory)
+                continue
+
+            best_pp_id = min(territory_points, key=lambda pp: abs(territory_points[pp] - target_price))
+
+            # Remove existing price for this territory before creating new one
+            if territory in existing_by_territory:
+                try:
+                    self.request("DELETE", f"/v1/subscriptionPrices/{existing_by_territory[territory]}")
+                except RuntimeError:
+                    logger.warning("Could not delete existing subscription price for %s", territory)
+
+            self.request(
+                "POST",
+                "/v1/subscriptionPrices",
+                json_body={
+                    "data": {
+                        "type": "subscriptionPrices",
+                        "attributes": {"startDate": None, "preserveCurrentPrice": False},
+                        "relationships": {
+                            "subscription": {
+                                "data": {"type": "subscriptions", "id": subscription_id},
+                            },
+                            "subscriptionPricePoint": {
+                                "data": {"type": "subscriptionPricePoints", "id": best_pp_id},
+                            },
+                        },
+                    },
+                },
+            )
+            set_count += 1
+
+        return {"territories_set": set_count, "territories_skipped": not_found}
+
+    # ------------------------------------------------------------------
     # In-app purchase management
     # ------------------------------------------------------------------
 
@@ -750,7 +961,7 @@ class AppStoreConnectClient:
         """List localizations for an in-app purchase."""
         data = self.request(
             "GET",
-            f"/inAppPurchases/{iap_id}/inAppPurchaseLocalizations",
+            f"/v2/inAppPurchases/{iap_id}/inAppPurchaseLocalizations",
             params={"limit": "200"},
         )
         results: Dict[str, Dict[str, Any]] = {}
@@ -793,6 +1004,10 @@ class AppStoreConnectClient:
             },
         )
         return data.get("data", {}).get("id", "")
+
+    def delete_in_app_purchase_localization(self, localization_id: str) -> None:
+        """Delete an IAP localization by its resource ID."""
+        self.request("DELETE", f"/inAppPurchaseLocalizations/{localization_id}")
 
     def update_in_app_purchase_localization(
         self,
@@ -897,6 +1112,10 @@ class AppStoreConnectClient:
             },
         )
         return data.get("data", {}).get("id", "")
+
+    def delete_subscription_localization(self, localization_id: str) -> None:
+        """Delete a subscription localization by its resource ID."""
+        self.request("DELETE", f"/subscriptionLocalizations/{localization_id}")
 
     def update_subscription_localization(
         self,
@@ -1322,6 +1541,7 @@ def sync_iap_localizations(
     client: AppStoreConnectClient,
     app_id: str,
     products: Sequence[Dict[str, Any]],
+    delete_missing: bool = False,
 ) -> Dict[str, Any]:
     """Sync in-app purchase localizations.
 
@@ -1332,10 +1552,14 @@ def sync_iap_localizations(
             ...
         }}
 
-    Returns ``{"ok": True, "created": int, "updated": int, "missing_products": [...]}``.
+    When *delete_missing* is True, remote localizations not present in the
+    local list are deleted from App Store Connect.
+
+    Returns ``{"ok": True, "created": int, "updated": int, "deleted": int, "missing_products": [...]}``.
     """
     created_count = 0
     updated_count = 0
+    deleted_count = 0
     missing: List[str] = []
 
     for product in products:
@@ -1365,10 +1589,17 @@ def sync_iap_localizations(
                 )
                 created_count += 1
 
+        if delete_missing:
+            for locale, remote in existing.items():
+                if locale not in localizations and remote.get("id"):
+                    client.delete_in_app_purchase_localization(remote["id"])
+                    deleted_count += 1
+
     return {
         "ok": True,
         "created": created_count,
         "updated": updated_count,
+        "deleted": deleted_count,
         "missing_products": missing,
     }
 
@@ -1377,6 +1608,7 @@ def sync_subscription_localizations(
     client: AppStoreConnectClient,
     app_id: str,
     subscriptions: Sequence[Dict[str, Any]],
+    delete_missing: bool = False,
 ) -> Dict[str, Any]:
     """Sync subscription localizations.
 
@@ -1387,10 +1619,14 @@ def sync_subscription_localizations(
             ...
         }}
 
-    Returns ``{"ok": True, "created": int, "updated": int, "missing_subscriptions": [...]}``.
+    When *delete_missing* is True, remote localizations not present in the
+    local list are deleted from App Store Connect.
+
+    Returns ``{"ok": True, "created": int, "updated": int, "deleted": int, "missing_subscriptions": [...]}``.
     """
     created_count = 0
     updated_count = 0
+    deleted_count = 0
     missing: List[str] = []
 
     for sub in subscriptions:
@@ -1420,9 +1656,96 @@ def sync_subscription_localizations(
                 )
                 created_count += 1
 
+        if delete_missing:
+            for locale, remote in existing.items():
+                if locale not in localizations and remote.get("id"):
+                    client.delete_subscription_localization(remote["id"])
+                    deleted_count += 1
+
     return {
         "ok": True,
         "created": created_count,
         "updated": updated_count,
+        "deleted": deleted_count,
+        "missing_subscriptions": missing,
+    }
+
+
+def sync_iap_pricing(
+    client: AppStoreConnectClient,
+    app_id: str,
+    products: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Sync IAP pricing to App Store Connect for all products that have a ``pricing`` field.
+
+    Each item in *products*::
+
+        {"product_id": "com.example.credits", "pricing": {"USA": {"currency": "USD", "price": 1.99}, ...}}
+
+    Returns ``{"ok": True, "products_updated": int, "territories_set": int, "missing_products": [...]}``.
+    """
+    products_updated = 0
+    total_territories = 0
+    missing: List[str] = []
+
+    for product in products:
+        product_id = product.get("product_id", "")
+        pricing = product.get("pricing")
+        if not pricing:
+            continue
+
+        iap_id = client.find_in_app_purchase_id(app_id, product_id)
+        if iap_id is None:
+            missing.append(product_id)
+            continue
+
+        result = client.set_iap_pricing(iap_id, pricing)
+        products_updated += 1
+        total_territories += result.get("territories_set", 0)
+
+    return {
+        "ok": True,
+        "products_updated": products_updated,
+        "territories_set": total_territories,
+        "missing_products": missing,
+    }
+
+
+def sync_subscription_pricing(
+    client: AppStoreConnectClient,
+    app_id: str,
+    subscriptions: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Sync subscription pricing to App Store Connect for all subscriptions with a ``pricing`` field.
+
+    Each item in *subscriptions*::
+
+        {"product_id": "com.example.premium", "pricing": {"USA": {"currency": "USD", "price": 4.99}, ...}}
+
+    Returns ``{"ok": True, "subscriptions_updated": int, "territories_set": int, "missing_subscriptions": [...]}``.
+    """
+    subscriptions_updated = 0
+    total_territories = 0
+    missing: List[str] = []
+
+    for sub in subscriptions:
+        product_id = sub.get("product_id", "")
+        pricing = sub.get("pricing")
+        if not pricing:
+            continue
+
+        sub_id = client.find_subscription_id(app_id, product_id)
+        if sub_id is None:
+            missing.append(product_id)
+            continue
+
+        result = client.set_subscription_pricing(sub_id, pricing)
+        subscriptions_updated += 1
+        total_territories += result.get("territories_set", 0)
+
+    return {
+        "ok": True,
+        "subscriptions_updated": subscriptions_updated,
+        "territories_set": total_territories,
         "missing_subscriptions": missing,
     }

@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, MutableMapping, Sequence
 
 from .models import DEFAULT_STORE_SECTION, StoreName
 from .validation import validate_listing as _validate_listing
+from .validation import validate_products as _validate_products
+from .validation import _IAP_LOC_KEY
 
 if TYPE_CHECKING:
     from .storage import StorageBackend
@@ -87,6 +89,7 @@ def diff_objects(left: Any, right: Any, prefix: str = "") -> Dict[str, Any]:
 class ListingService:
     def __init__(self, storage: StorageBackend) -> None:
         self.storage = storage
+        self._tx_doc: Dict[str, Any] | None = None  # None = no active transaction
 
     def get_credentials(self, app: str, store: str) -> Dict[str, Any]:
         return self.storage.load_credentials(app, store)
@@ -95,7 +98,34 @@ class ListingService:
         self.storage.save_credentials(app, store, data)
 
     def _doc(self) -> Dict[str, Any]:
+        if self._tx_doc is not None:
+            return deepcopy(self._tx_doc)
         return self.storage.load()
+
+    def _save(self, doc: Dict[str, Any]) -> None:
+        if self._tx_doc is not None:
+            self._tx_doc = deepcopy(doc)
+        else:
+            self.storage.save(doc)
+
+    def begin_transaction(self) -> None:
+        """Start a transaction. All subsequent writes are buffered in memory."""
+        if self._tx_doc is not None:
+            raise RuntimeError("A transaction is already active. Commit or rollback first.")
+        self._tx_doc = self.storage.load()
+
+    def commit_transaction(self) -> None:
+        """Flush buffered changes to disk and end the transaction."""
+        if self._tx_doc is None:
+            raise RuntimeError("No active transaction.")
+        self.storage.save(self._tx_doc)
+        self._tx_doc = None
+
+    def rollback_transaction(self) -> None:
+        """Discard all buffered changes and end the transaction."""
+        if self._tx_doc is None:
+            raise RuntimeError("No active transaction.")
+        self._tx_doc = None
 
     def _ensure_versioning(self, section: Dict[str, Any]) -> Dict[str, Any]:
         versioning = section.get("versioning")
@@ -301,7 +331,7 @@ class ListingService:
                 versioning["baseline_locale"] = selected_baseline
                 versioning["locale_versions"].setdefault(selected_baseline, versioning["current_version"])
 
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True, "initialized_stores": initialized, "stores": selected_stores}
 
     def list_languages(self, app: str, store: StoreName) -> List[str]:
@@ -349,7 +379,7 @@ class ListingService:
 
         versioning = self._ensure_versioning(section)
         versioning["locale_versions"].setdefault(locale, 0)
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True, "created": created, "locale": locale}
 
     def get_element(self, app: str, store: StoreName, key_path: str, locale: str | None = None) -> Any:
@@ -389,7 +419,7 @@ class ListingService:
             locale=locale,
             default_scope_for_none="global",
         )
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True}
 
     def replace_section(
@@ -435,7 +465,7 @@ class ListingService:
                 section["global"] = deepcopy(payload)
 
             self._record_version_change(section, reason="replace-section", scope="store", locale=None)
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True}
 
     def delete_element(
@@ -461,8 +491,65 @@ class ListingService:
                 locale=locale,
                 default_scope_for_none="global",
             )
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True, "deleted": deleted}
+
+    def delete_locale(
+        self,
+        app: str,
+        store: StoreName,
+        locale: str,
+    ) -> Dict[str, Any]:
+        doc = self._doc()
+        section = self._store_section(doc, app, store, create=False)
+        locales = section["locales"]
+        if not isinstance(locales, dict):
+            raise ValueError(f"{app}/{store}/locales must be an object.")
+        deleted = locales.pop(locale, None) is not None
+        if deleted:
+            versioning = self._ensure_versioning(section)
+            versioning.get("locale_versions", {}).pop(locale, None)
+            self._record_version_change(
+                section, reason=f"delete-locale:{locale}", scope="store", locale=None
+            )
+        self._save(doc)
+        return {"ok": True, "deleted": deleted, "locale": locale}
+
+    def delete_product(
+        self,
+        app: str,
+        store: StoreName,
+        product_id: str,
+        is_subscription: bool = False,
+    ) -> Dict[str, Any]:
+        doc = self._doc()
+        section = self._store_section(doc, app, store, create=False)
+        key = "subscriptions" if is_subscription else "products"
+        container = section.get(key, {})
+        if not isinstance(container, dict):
+            raise ValueError(f"{app}/{store}/{key} must be an object.")
+        deleted = container.pop(product_id, None) is not None
+        self._save(doc)
+        return {"ok": True, "deleted": deleted, "product_id": product_id}
+
+    def delete_release_notes_locale(
+        self,
+        app: str,
+        store: StoreName,
+        app_version: str,
+        locale: str,
+    ) -> Dict[str, Any]:
+        doc = self._doc()
+        section = self._store_section(doc, app, store, create=False)
+        rn = section["release_notes"]
+        version_notes = rn.get(app_version)
+        if version_notes is None:
+            raise KeyError(f"No release notes for version {app_version}")
+        if not isinstance(version_notes, dict):
+            raise ValueError(f"release_notes[{app_version}] must be an object.")
+        deleted = version_notes.pop(locale, None) is not None
+        self._save(doc)
+        return {"ok": True, "deleted": deleted, "app_version": app_version, "locale": locale}
 
     def upsert_locale(
         self,
@@ -491,8 +578,54 @@ class ListingService:
             locale=locale,
             default_scope_for_none="store",
         )
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True}
+
+    def set_products(
+        self,
+        app: str,
+        store: StoreName,
+        products: Dict[str, Any],
+        subscriptions: Dict[str, Any] | None = None,
+        merge: bool = True,
+    ) -> Dict[str, Any]:
+        """Configure IAP products and subscriptions in the local listing file."""
+        doc = self._doc()
+        section = self._store_section(doc, app, store, create=True)
+
+        if merge:
+            for pid, pcfg in products.items():
+                existing = section["products"].get(pid)
+                if isinstance(existing, dict) and isinstance(pcfg, dict):
+                    existing.update(deepcopy(pcfg))
+                else:
+                    section["products"][pid] = deepcopy(pcfg)
+            if subscriptions:
+                for sid, scfg in subscriptions.items():
+                    existing = section["subscriptions"].get(sid)
+                    if isinstance(existing, dict) and isinstance(scfg, dict):
+                        existing.update(deepcopy(scfg))
+                    else:
+                        section["subscriptions"][sid] = deepcopy(scfg)
+        else:
+            section["products"] = deepcopy(products)
+            if subscriptions is not None:
+                section["subscriptions"] = deepcopy(subscriptions)
+        self._save(doc)
+
+        # Count total locale entries added across all products
+        loc_key = _IAP_LOC_KEY.get(store, "localizations")
+        total_locales = sum(
+            len(p.get(loc_key, {})) for p in products.values() if isinstance(p, dict)
+        )
+        result: Dict[str, Any] = {
+            "ok": True,
+            "product_count": len(products),
+            "total_localization_entries": total_locales,
+        }
+        if subscriptions:
+            result["subscription_count"] = len(subscriptions)
+        return result
 
     def set_baseline_locale(self, app: str, store: StoreName, locale: str) -> Dict[str, Any]:
         doc = self._doc()
@@ -502,7 +635,7 @@ class ListingService:
         versioning = self._ensure_versioning(section)
         versioning["baseline_locale"] = locale
         versioning["locale_versions"].setdefault(locale, self._current_version(section))
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True, "baseline_locale": locale}
 
     def _save_snapshot(
@@ -548,7 +681,7 @@ class ListingService:
         )
         if source_locale:
             self._mark_locale_at_current_version(section, source_locale)
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True, "current_version": next_version}
 
     def mark_language_updated(self, app: str, store: StoreName, locale: str) -> Dict[str, Any]:
@@ -557,7 +690,7 @@ class ListingService:
         locales = section["locales"]
         locales.setdefault(locale, {})
         self._mark_locale_at_current_version(section, locale)
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True, "locale": locale, "version": self._current_version(section)}
 
     def get_update_status(self, app: str, store: StoreName) -> Dict[str, Any]:
@@ -674,7 +807,7 @@ class ListingService:
         self._record_version_change(
             section, reason="import-from-play-store", scope="store", locale=None,
         )
-        self.storage.save(doc)
+        self._save(doc)
 
         # Snapshot state after import
         new_ver = self._current_version(section)
@@ -729,7 +862,7 @@ class ListingService:
         self._record_version_change(
             section, reason="import-from-app-store", scope="store", locale=None,
         )
-        self.storage.save(doc)
+        self._save(doc)
 
         # Snapshot state after import
         new_ver = self._current_version(section)
@@ -867,7 +1000,7 @@ class ListingService:
             }
         ]
 
-        self.storage.save(doc)
+        self._save(doc)
         return {
             "ok": True,
             "target_app": target_app,
@@ -931,7 +1064,7 @@ class ListingService:
             scope="store",
             locale=None,
         )
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True, "restored_version": version, "current_version": new_ver}
 
     def diff_with_snapshot(
@@ -981,7 +1114,10 @@ class ListingService:
     ) -> Dict[str, Any]:
         """Validate local listing data against store character limits.
 
-        Returns ``{"ok": bool, "errors": [...]}``.
+        Also validates that every IAP product has localizations for all
+        configured locales and that required fields are present.
+
+        Returns ``{"ok": bool, "errors": [...], "product_errors": [...]}``.
         """
         doc = self._doc()
         section = self._store_section(doc, app, store, create=False)
@@ -990,7 +1126,20 @@ class ListingService:
         if locales:
             locales_map = {k: v for k, v in locales_map.items() if k in locales}
 
-        return _validate_listing(store, locales_map)
+        result = _validate_listing(store, locales_map)
+
+        products = section.get("products", {})
+        subscriptions = section.get("subscriptions", {})
+        all_iap = {**products, **subscriptions}
+        if all_iap:
+            product_result = _validate_products(store, all_iap, sorted(locales_map.keys()))
+            result["product_errors"] = product_result["errors"]
+            if not product_result["ok"]:
+                result["ok"] = False
+        else:
+            result["product_errors"] = []
+
+        return result
 
     # ------------------------------------------------------------------
     # Release notes
@@ -1014,7 +1163,7 @@ class ListingService:
         if not isinstance(version_notes, dict):
             raise ValueError(f"release_notes[{app_version}] must be an object.")
         version_notes[locale] = text
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True}
 
     def upsert_release_notes(
@@ -1036,7 +1185,7 @@ class ListingService:
         if not isinstance(version_notes, dict):
             raise ValueError(f"release_notes[{app_version}] must be an object.")
         version_notes.update(data)
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True}
 
     def get_release_notes(
@@ -1081,7 +1230,7 @@ class ListingService:
         section = self._store_section(doc, app, store, create=False)
         rn = section["release_notes"]
         deleted = rn.pop(app_version, None) is not None
-        self.storage.save(doc)
+        self._save(doc)
         return {"ok": True, "deleted": deleted}
 
     def validate_release_notes(

@@ -15,6 +15,7 @@ from .project_router import ProjectListingRouter
 from .service import diff_objects
 from . import play_store as play_store_api
 from . import app_store as app_store_api
+from . import regional_pricing
 
 
 StoreName = Literal["play", "app_store"]
@@ -40,6 +41,15 @@ _TOOL_HINTS: dict[str, str] = {
     ),
     "perfectdeck_delete_element": (
         "Use perfectdeck_list_section to review remaining content."
+    ),
+    "perfectdeck_delete_locale": (
+        "Locale removed. Use perfectdeck_list_languages to verify remaining locales."
+    ),
+    "perfectdeck_delete_product": (
+        "Product removed. Use perfectdeck_list_section to verify remaining products."
+    ),
+    "perfectdeck_delete_release_notes_locale": (
+        "Locale removed from release notes. Use perfectdeck_get_release_notes to verify."
     ),
     "perfectdeck_upsert_locale": (
         "Run perfectdeck_validate_listing to check limits. "
@@ -152,20 +162,45 @@ _TOOL_HINTS: dict[str, str] = {
     "perfectdeck_push_app_store_screenshots": (
         "Screenshots uploaded to App Store Connect."
     ),
+    "perfectdeck_configure_iap": (
+        "IAP products saved locally. Use perfectdeck_sync_app_store_iap or perfectdeck_sync_play_products to push to stores."
+    ),
+    "perfectdeck_set_iap_pricing_tiers": (
+        "Regional pricing applied locally. Use perfectdeck_sync_play_products or perfectdeck_sync_app_store_iap to push to stores."
+    ),
+    "perfectdeck_get_pricing_tiers": (
+        "Shows built-in PPP tier config. Use perfectdeck_set_iap_pricing_tiers to apply pricing."
+    ),
+    "perfectdeck_get_app_store_app_id": (
+        "Use the returned app_id with perfectdeck_sync_app_store_iap or other App Store tools."
+    ),
     "perfectdeck_sync_app_store_iap": (
-        "IAP localizations synced to App Store Connect."
+        "IAP localizations synced to App Store Connect and saved locally."
     ),
     "perfectdeck_sync_app_store_subscriptions": (
-        "Subscription localizations synced to App Store Connect."
+        "Subscription localizations synced to App Store Connect and saved locally."
     ),
     "perfectdeck_sync_play_products": (
-        "Products synced to Google Play."
+        "Products synced to Google Play and saved locally."
+    ),
+    "perfectdeck_deactivate_play_product": (
+        "Product deactivated on Google Play. Use perfectdeck_delete_product to also remove it locally."
     ),
     "perfectdeck_sync_play_pricing": (
         "Regional pricing applied on Google Play."
     ),
     "perfectdeck_sync_play_subscription_pricing": (
         "Subscription pricing applied on Google Play."
+    ),
+    "perfectdeck_begin_transaction": (
+        "All mutations are buffered until commit. "
+        "Use perfectdeck_commit_transaction to persist or perfectdeck_rollback_transaction to discard."
+    ),
+    "perfectdeck_commit_transaction": (
+        "Changes flushed to disk. Use perfectdeck_validate_listing to verify."
+    ),
+    "perfectdeck_rollback_transaction": (
+        "All changes since BEGIN discarded. Use perfectdeck_get_element to confirm revert."
     ),
 }
 
@@ -309,6 +344,11 @@ class ProjectInput(BaseModel):
         description="Project path relative to MCP server root folder.",
         min_length=1,
     )
+
+
+class TransactionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
 
 
 class GetElementInput(BaseInput):
@@ -507,6 +547,26 @@ class DeleteReleaseNotesInput(ReleaseNotesBaseInput):
     pass
 
 
+class DeleteLocaleInput(BaseInput):
+    locale: str = Field(..., min_length=1, description="BCP-47 locale code to remove, e.g. 'fr-FR'.")
+
+
+class DeleteProductInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
+    app: str = Field(..., min_length=1, description="App identifier as defined in listings.yaml.")
+    store: StoreName = Field(..., description="Target store: 'play' or 'app_store'.")
+    product_id: str = Field(..., min_length=1, description="Product or subscription ID to remove.")
+    is_subscription: bool = Field(
+        default=False,
+        description="Set to true if the ID refers to a subscription rather than a one-time product.",
+    )
+
+
+class DeleteReleaseNotesLocaleInput(ReleaseNotesBaseInput):
+    locale: str = Field(..., min_length=1, description="BCP-47 locale code to remove from this version's release notes.")
+
+
 class ValidateReleaseNotesInput(VersioningInput):
     app_version: str | None = Field(
         default=None,
@@ -600,7 +660,7 @@ class PushPlayReleaseNotesInput(BaseModel):
     package_name: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
     credentials_path: str | None = Field(default=None)
     track: str = Field(default="production")
-    version_code: int = Field(..., description="Version code to update release notes for")
+    version_code: int | None = Field(default=None, description="Version code to update release notes for. If omitted, the latest release on the track is used.")
     locales: list[str] | None = Field(default=None)
     release_notes_version: str | None = Field(
         default=None,
@@ -675,9 +735,16 @@ class SyncAppStoreIapInput(BaseModel):
     key_id: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
     issuer_id: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
     private_key_path: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
-    products: list[dict[str, Any]] = Field(
-        ...,
-        description='List of {product_id, localizations: {locale: {name, description}}}',
+    products: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of {product_id, localizations: {locale: {name, description}}}. "
+            "When omitted and app is provided, products are auto-loaded from the local listing."
+        ),
+    )
+    delete_missing: bool = Field(
+        default=False,
+        description="When true, remote localizations not present locally are deleted from App Store Connect.",
     )
 
 
@@ -689,9 +756,16 @@ class SyncAppStoreSubscriptionsInput(BaseModel):
     key_id: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
     issuer_id: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
     private_key_path: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
-    subscriptions: list[dict[str, Any]] = Field(
-        ...,
-        description='List of {product_id, localizations: {locale: {name, description}}}',
+    subscriptions: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of {product_id, localizations: {locale: {name, description}}}. "
+            "When omitted and app is provided, subscriptions are auto-loaded from the local listing."
+        ),
+    )
+    delete_missing: bool = Field(
+        default=False,
+        description="When true, remote localizations not present locally are deleted from App Store Connect.",
     )
 
 
@@ -701,10 +775,113 @@ class SyncPlayProductsInput(BaseModel):
     app: str | None = Field(default=None, description="App identifier for credential resolution.")
     package_name: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
     credentials_path: str | None = Field(default=None)
-    products: list[dict[str, Any]] = Field(
-        ...,
-        description='List of {sku, default_price: {currency, price}, listings: {locale: {title, description}}}',
+    products: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "List of {sku, default_price: {currency, price}, listings: {locale: {title, description}}, "
+            "pricing: {country_code: {currency, price}}}. "
+            "The optional 'pricing' field sets per-country prices using 2-letter ISO country codes (US, GB, CA, AU, …). "
+            "Regional prices are applied automatically after the product is created/updated. "
+            "When omitted and app is provided, products are auto-loaded from the local listing."
+        ),
     )
+
+
+class DeactivatePlayProductInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
+    app: str | None = Field(default=None, description="App identifier for credential resolution.")
+    package_name: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+    credentials_path: str | None = Field(default=None)
+    sku: str = Field(..., min_length=1, description="Product SKU to deactivate.")
+
+
+class ConfigureIapInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
+    app: str = Field(..., min_length=1, description="App identifier as defined in listings.yaml.")
+    store: StoreName = Field(..., description="Target store: 'play' or 'app_store'.")
+    products: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Map of product_id → product config dict. "
+            "App Store: {\"type\": \"consumable\", \"localizations\": {\"en-US\": {\"name\": \"10 Credits\", \"description\": \"...\"}}, "
+            "\"pricing\": {\"USA\": {\"currency\": \"USD\", \"price\": 1.99}, \"GBR\": {\"currency\": \"GBP\", \"price\": 1.79}, \"CAN\": {\"currency\": \"CAD\", \"price\": 2.49}}}. "
+            "Play Store: {\"default_price\": {\"currency\": \"USD\", \"price\": 1.99}, \"listings\": {\"en-US\": {\"title\": \"10 Credits\", \"description\": \"...\"}}, "
+            "\"pricing\": {\"GB\": {\"currency\": \"GBP\", \"price\": 1.79}, \"CA\": {\"currency\": \"CAD\", \"price\": 2.49}}}. "
+            "Shorthand: use \"pricing_tiers\": {\"base_usd\": 1.99} instead of a manual \"pricing\" dict to auto-generate "
+            "regional prices for 100+ countries via PPP tiers. "
+            "Supports optional keys: \"live_rates\" (bool, default true), \"exchange_rate_overrides\" ({currency: rate}), "
+            "\"include_tier5\" (bool), \"currency_overrides\" ({country: currency}), \"tier_overrides\" ({tier: config}). "
+            "Locales not provided are auto-filled from the baseline locale. "
+            "Play Store uses 2-letter country codes (US, GB, CA); App Store uses 3-letter codes (USA, GBR, CAN)."
+        ),
+    )
+    subscriptions: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Map of subscription_id → subscription config dict.",
+    )
+    merge: bool = Field(
+        default=True,
+        description="If true (default), merge with existing products. If false, replace the entire products/subscriptions section.",
+    )
+
+
+class SetIapPricingTiersInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
+    app: str = Field(..., min_length=1, description="App identifier as defined in listings.yaml.")
+    store: StoreName = Field(..., description="Target store: 'play' or 'app_store'.")
+    product_prices: dict[str, float] = Field(
+        ...,
+        description=(
+            "Map of product_id → base price in USD. "
+            "e.g. {'com.app.credits_10': 1.99, 'com.app.credits_25': 3.99}"
+        ),
+    )
+    tier_overrides: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional override for tier multipliers or country lists.",
+    )
+    include_tier5: bool = Field(
+        default=False,
+        description="Include Tier 5 (Emerging Markets, 0.25× price). Off by default.",
+    )
+    currency_overrides: dict[str, str] | None = Field(
+        default=None,
+        description="Optional {country_2letter: currency_code} overrides.",
+    )
+    live_rates: bool = Field(
+        default=True,
+        description=(
+            "Fetch current exchange rates from open.er-api.com before calculating. "
+            "Falls back to hardcoded rates on network failure. Default: true."
+        ),
+    )
+    exchange_rate_overrides: dict[str, float] | None = Field(
+        default=None,
+        description=(
+            "Optional {currency_code: rate} overrides applied on top of live/hardcoded rates. "
+            "e.g. {\"JPY\": 155.0, \"EUR\": 0.88}. Takes highest priority."
+        ),
+    )
+    countries: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional list of 2-letter country codes to include. "
+            "When set, only these countries are priced; all others are skipped. "
+            "e.g. [\"US\", \"GB\", \"CA\", \"AU\", \"DE\"]. "
+            "Play Store uses 2-letter codes; App Store territory codes are derived automatically."
+        ),
+    )
+
+
+class GetAppStoreAppIdInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    bundle_id: str = Field(..., min_length=1, description="The app's bundle ID, e.g. 'me.jodoin.plantmatch'.")
+    key_id: str = Field(..., min_length=1, description="App Store Connect API key ID.")
+    issuer_id: str = Field(..., min_length=1, description="App Store Connect API issuer ID.")
+    private_key_path: str = Field(..., min_length=1, description="Path to the .p8 private key file.")
 
 
 class SyncPlayPricingInput(BaseModel):
@@ -732,6 +909,70 @@ class SyncPlaySubscriptionPricingInput(BaseModel):
         ...,
         description='Map of {region_code: {currency, price}}',
     )
+
+
+@mcp.tool(
+    name="perfectdeck_begin_transaction",
+    annotations={
+        "title": "Begin Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def perfectdeck_begin_transaction(params: TransactionInput) -> str:
+    """Start a transaction — all listing mutations are buffered in memory.
+
+    Call perfectdeck_commit_transaction to persist or perfectdeck_rollback_transaction to discard.
+    Raises if a transaction is already active.
+
+    Returns: {"ok": true}
+    """
+    _router().service_for(params.project_path).begin_transaction()
+    return _result({"ok": True}, "perfectdeck_begin_transaction")
+
+
+@mcp.tool(
+    name="perfectdeck_commit_transaction",
+    annotations={
+        "title": "Commit Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def perfectdeck_commit_transaction(params: TransactionInput) -> str:
+    """Flush all buffered listing mutations to disk and end the transaction.
+
+    Raises if no transaction is active.
+
+    Returns: {"ok": true}
+    """
+    _router().service_for(params.project_path).commit_transaction()
+    return _result({"ok": True}, "perfectdeck_commit_transaction")
+
+
+@mcp.tool(
+    name="perfectdeck_rollback_transaction",
+    annotations={
+        "title": "Rollback Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def perfectdeck_rollback_transaction(params: TransactionInput) -> str:
+    """Discard all buffered listing mutations and end the transaction. The file on disk is unchanged.
+
+    Raises if no transaction is active.
+
+    Returns: {"ok": true}
+    """
+    _router().service_for(params.project_path).rollback_transaction()
+    return _result({"ok": True}, "perfectdeck_rollback_transaction")
 
 
 @mcp.tool(
@@ -823,6 +1064,58 @@ def perfectdeck_delete_element(params: DeleteElementInput) -> str:
         locale=params.locale,
     )
     return _result(out, "perfectdeck_delete_element")
+
+
+@mcp.tool(
+    name="perfectdeck_delete_locale",
+    annotations={
+        "title": "Delete Locale",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def perfectdeck_delete_locale(params: DeleteLocaleInput) -> str:
+    """Remove an entire locale and all its content from an app/store listing.
+
+    Also removes the locale from version tracking. This is irreversible locally
+    (use perfectdeck_save_snapshot first if you want a rollback point).
+
+    Returns: {"ok": true, "deleted": true/false, "locale": "..."}
+    """
+    service = _router().service_for(params.project_path)
+    out = service.delete_locale(app=params.app, store=params.store, locale=params.locale)
+    out["remaining_languages"] = service.list_languages(app=params.app, store=params.store)
+    return _result(out, "perfectdeck_delete_locale")
+
+
+@mcp.tool(
+    name="perfectdeck_delete_product",
+    annotations={
+        "title": "Delete Product or Subscription",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def perfectdeck_delete_product(params: DeleteProductInput) -> str:
+    """Remove a single IAP product or subscription from the local listing by its ID.
+
+    Set is_subscription=true to remove from the subscriptions section.
+    Does not push to any store — use sync tools after to propagate changes.
+
+    Returns: {"ok": true, "deleted": true/false, "product_id": "..."}
+    """
+    service = _router().service_for(params.project_path)
+    out = service.delete_product(
+        app=params.app,
+        store=params.store,
+        product_id=params.product_id,
+        is_subscription=params.is_subscription,
+    )
+    return _result(out, "perfectdeck_delete_product")
 
 
 @mcp.tool(
@@ -1680,6 +1973,34 @@ def perfectdeck_delete_release_notes(params: DeleteReleaseNotesInput) -> str:
 
 
 @mcp.tool(
+    name="perfectdeck_delete_release_notes_locale",
+    annotations={
+        "title": "Delete Release Notes for One Locale",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def perfectdeck_delete_release_notes_locale(params: DeleteReleaseNotesLocaleInput) -> str:
+    """Remove release notes for a single locale from a specific app version.
+
+    Use this to drop one language's notes without affecting the other locales
+    in the same version.
+
+    Returns: {"ok": true, "deleted": true/false, "app_version": "...", "locale": "..."}
+    """
+    service = _router().service_for(params.project_path)
+    out = service.delete_release_notes_locale(
+        app=params.app,
+        store=params.store,
+        app_version=params.app_version,
+        locale=params.locale,
+    )
+    return _result(out, "perfectdeck_delete_release_notes_locale")
+
+
+@mcp.tool(
     name="perfectdeck_validate_release_notes",
     annotations={
         "title": "Validate Release Notes",
@@ -1894,7 +2215,63 @@ def perfectdeck_publish_play_bundle(params: PublishPlayBundleInput) -> str:
     },
 )
 def perfectdeck_sync_play_products(params: SyncPlayProductsInput) -> str:
-    """Create or update managed one-time in-app products on Google Play."""
+    """Create or update managed one-time in-app products on Google Play.
+
+    When products is omitted, all products from the local listing are synced automatically.
+    Regional pricing from the local listing pricing field is applied per-product.
+    """
+    if params.app:
+        pkg, creds = _resolve_play_credentials(params.project_path, params.app, params.package_name, params.credentials_path)
+    else:
+        if not params.package_name:
+            raise ValueError("package_name is required when app is not set for credential resolution.")
+        pkg, creds = params.package_name, params.credentials_path
+
+    products = params.products
+    if not products and params.app:
+        local = _router().service_for(params.project_path).list_section(params.app, "play")
+        products = _local_products_to_play_list(local.get("products", {}))
+    if not products:
+        raise ValueError("No products to sync. Provide products or configure them locally with perfectdeck_configure_iap.")
+
+    api = play_store_api.create_service(credentials_path=creds)
+    out = play_store_api.ensure_managed_products(
+        service=api,
+        package_name=pkg,
+        products=products,
+    )
+    if params.app:
+        _persist_play_credentials(params.project_path, params.app, pkg, creds)
+        products_dict = {
+            p["sku"]: {k: v for k, v in p.items() if k != "sku"}
+            for p in products
+            if p.get("sku")
+        }
+        if products_dict:
+            _router().service_for(params.project_path).set_products(params.app, "play", products_dict)
+    return _result(out, "perfectdeck_sync_play_products")
+
+
+@mcp.tool(
+    name="perfectdeck_deactivate_play_product",
+    annotations={
+        "title": "Deactivate Play Managed Product",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_deactivate_play_product(params: DeactivatePlayProductInput) -> str:
+    """Set a managed one-time product to inactive on Google Play.
+
+    Google Play does not support permanent deletion of published products via the API.
+    Setting a product inactive hides it from new buyers while preserving purchase history.
+
+    Use perfectdeck_delete_product (without credentials) to also remove it from the local listing.
+
+    Returns: {"ok": true, "sku": "...", "status": "inactive"}
+    """
     if params.app:
         pkg, creds = _resolve_play_credentials(params.project_path, params.app, params.package_name, params.credentials_path)
     else:
@@ -1902,14 +2279,14 @@ def perfectdeck_sync_play_products(params: SyncPlayProductsInput) -> str:
             raise ValueError("package_name is required when app is not set for credential resolution.")
         pkg, creds = params.package_name, params.credentials_path
     api = play_store_api.create_service(credentials_path=creds)
-    out = play_store_api.ensure_managed_products(
+    out = play_store_api.deactivate_managed_product(
         service=api,
         package_name=pkg,
-        products=params.products,
+        sku=params.sku,
     )
     if params.app:
         _persist_play_credentials(params.project_path, params.app, pkg, creds)
-    return _result(out, "perfectdeck_sync_play_products")
+    return _result(out, "perfectdeck_deactivate_play_product")
 
 
 @mcp.tool(
@@ -2102,6 +2479,212 @@ def perfectdeck_push_app_store_screenshots(params: PushAppStoreScreenshotsInput)
 
 
 @mcp.tool(
+    name="perfectdeck_get_app_store_app_id",
+    annotations={
+        "title": "Look Up App Store App ID",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_get_app_store_app_id(params: GetAppStoreAppIdInput) -> str:
+    """Look up the numeric App Store Connect app ID for a given bundle ID.
+
+    Use this when you have API credentials but don't know the numeric app_id
+    required by other App Store tools.
+    """
+    client = app_store_api.AppStoreConnectClient.from_key_file(
+        key_id=params.key_id,
+        issuer_id=params.issuer_id,
+        private_key_path=params.private_key_path,
+    )
+    app_id = client.find_app_id_by_bundle_id(params.bundle_id)
+    if not app_id:
+        raise ValueError(f"No app found with bundle ID: {params.bundle_id}")
+    return _result({"ok": True, "bundle_id": params.bundle_id, "app_id": app_id}, "perfectdeck_get_app_store_app_id")
+
+
+@mcp.tool(
+    name="perfectdeck_configure_iap",
+    annotations={
+        "title": "Configure IAP Products Locally",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def _local_products_to_play_list(products: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert local listing products dict → sync_play_products list format."""
+    result = []
+    for sku, cfg in products.items():
+        if not isinstance(cfg, dict):
+            continue
+        entry: dict[str, Any] = {"sku": sku}
+        if "default_price" in cfg:
+            entry["default_price"] = cfg["default_price"]
+        if "listings" in cfg:
+            entry["listings"] = cfg["listings"]
+        if "pricing" in cfg:
+            entry["pricing"] = cfg["pricing"]
+        result.append(entry)
+    return result
+
+
+def _local_products_to_app_store_list(products: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert local listing products dict → sync_app_store_iap list format."""
+    result = []
+    for product_id, cfg in products.items():
+        if not isinstance(cfg, dict):
+            continue
+        entry: dict[str, Any] = {"product_id": product_id}
+        if "localizations" in cfg:
+            entry["localizations"] = cfg["localizations"]
+        if "pricing" in cfg:
+            entry["pricing"] = cfg["pricing"]
+        result.append(entry)
+    return result
+
+
+def _expand_pricing_tiers(products: dict[str, Any], store: str) -> dict[str, Any]:
+    """Replace pricing_tiers shorthand with a fully calculated pricing dict."""
+    expanded: dict[str, Any] = {}
+    for pid, cfg in products.items():
+        if not isinstance(cfg, dict) or "pricing_tiers" not in cfg:
+            expanded[pid] = cfg
+            continue
+        cfg = dict(cfg)
+        tier_cfg = cfg.pop("pricing_tiers")
+        if not isinstance(tier_cfg, dict):
+            tier_cfg = {}
+        base_usd: float = float(tier_cfg.get("base_usd", 0.0))
+        include_tier5: bool = bool(tier_cfg.get("include_tier5", False))
+        currency_overrides: dict | None = tier_cfg.get("currency_overrides")
+        tier_overrides: dict | None = tier_cfg.get("tier_overrides")
+        live_rates: bool = bool(tier_cfg.get("live_rates", True))
+        exchange_rate_overrides: dict | None = tier_cfg.get("exchange_rate_overrides")
+        countries: list | None = tier_cfg.get("countries")
+        cfg["pricing"] = regional_pricing.calculate_regional_prices(
+            base_usd=base_usd,
+            store=store,
+            tiers=tier_overrides,
+            include_tier5=include_tier5,
+            currency_overrides=currency_overrides,
+            live_rates=live_rates,
+            exchange_rate_overrides=exchange_rate_overrides,
+            countries=countries,
+        )
+        expanded[pid] = cfg
+    return expanded
+
+
+def perfectdeck_configure_iap(params: ConfigureIapInput) -> str:
+    """Configure IAP products and subscriptions in the local listing file without pushing to any store.
+
+    Use this to define product IDs, pricing, and localizations locally before syncing.
+    Does not require store credentials. Safe to call at any time.
+
+    Supports a ``pricing_tiers`` shorthand per product: instead of manually specifying
+    regional prices, provide ``{"pricing_tiers": {"base_usd": 1.99}}`` and the tool
+    auto-generates prices for 100+ countries using PPP tiers.
+    """
+    products = _expand_pricing_tiers(dict(params.products), params.store)
+    svc = _router().service_for(params.project_path)
+    out = svc.set_products(
+        params.app,
+        params.store,
+        products,
+        params.subscriptions or None,
+        merge=params.merge,
+    )
+    return _result(out, "perfectdeck_configure_iap")
+
+
+@mcp.tool(
+    name="perfectdeck_set_iap_pricing_tiers",
+    annotations={
+        "title": "Set IAP Pricing via PPP Tiers",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def perfectdeck_set_iap_pricing_tiers(params: SetIapPricingTiersInput) -> str:
+    """Auto-configure regional pricing for IAP products using PPP tiers.
+
+    Provide only the base USD price per product; the tool calculates prices for
+    100+ countries across 5 income tiers with currency-aware price point snapping.
+
+    Tiers (multipliers):
+      tier1 (1.0×): US, CA, AU, GB, DE, FR, NL, Nordic, Gulf...
+      tier2 (0.75×): ES, IT, PT, KR, JP, TW, Baltic...
+      tier3 (0.5×):  PL, BR, MX, TH, TR, ZA, RU...
+      tier4 (0.35×): IN, ID, PH, VN, NG, EG...
+      tier5 (0.25×): ET, MW, RW, HT... (opt-in via include_tier5)
+
+    Currencies: EUR for Eurozone, GBP for GB, INR for IN, BRL for BR,
+    JPY for JP, KRW for KR, CAD for CA, AUD for AU, and local currencies for
+    25+ additional markets. USD fallback for the rest.
+
+    Play Store uses 2-letter codes; App Store uses 3-letter territory codes.
+    Merges into existing product config, preserving localizations.
+    """
+    svc = _router().service_for(params.project_path)
+    # Fetch live rates once, shared across all products in this call
+    pricing_data: dict[str, Any] = {}
+    for product_id, base_usd in params.product_prices.items():
+        regional = regional_pricing.calculate_regional_prices(
+            base_usd=base_usd,
+            store=params.store,
+            tiers=params.tier_overrides,
+            include_tier5=params.include_tier5,
+            currency_overrides=params.currency_overrides,
+            live_rates=params.live_rates,
+            exchange_rate_overrides=params.exchange_rate_overrides,
+            countries=params.countries,
+        )
+        pricing_data[product_id] = {"pricing": regional}
+
+    svc.set_products(params.app, params.store, pricing_data, merge=True)
+
+    country_count = len(next(iter(pricing_data.values()))["pricing"]) if pricing_data else 0
+    return _result(
+        {
+            "ok": True,
+            "products_configured": len(params.product_prices),
+            "countries_configured": country_count,
+            "store": params.store,
+        },
+        "perfectdeck_set_iap_pricing_tiers",
+    )
+
+
+@mcp.tool(
+    name="perfectdeck_get_pricing_tiers",
+    annotations={
+        "title": "Get Built-in PPP Pricing Tiers",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def perfectdeck_get_pricing_tiers() -> str:
+    """Return the built-in PPP pricing tier configuration.
+
+    Shows all tiers, their multipliers, and which countries are included.
+    Useful for understanding what regional pricing will be applied before
+    calling perfectdeck_set_iap_pricing_tiers.
+    """
+    return _result(
+        {"ok": True, "tiers": regional_pricing.PRICING_TIERS},
+        "perfectdeck_get_pricing_tiers",
+    )
+
+
+@mcp.tool(
     name="perfectdeck_sync_app_store_iap",
     annotations={
         "title": "Sync App Store IAP Localizations",
@@ -2112,7 +2695,12 @@ def perfectdeck_push_app_store_screenshots(params: PushAppStoreScreenshotsInput)
     },
 )
 def perfectdeck_sync_app_store_iap(params: SyncAppStoreIapInput) -> str:
-    """Sync in-app purchase localizations to App Store Connect."""
+    """Sync in-app purchase localizations and pricing to App Store Connect.
+
+    When products is omitted, all products from the local listing are synced automatically.
+    Set delete_missing=true to remove remote localizations not present in the local listing.
+    Products that have a ``pricing`` field will have their regional pricing pushed automatically.
+    """
     if params.app:
         r_app_id, r_key_id, r_issuer_id, r_pk = _resolve_app_store_credentials(
             params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path,
@@ -2121,6 +2709,14 @@ def perfectdeck_sync_app_store_iap(params: SyncAppStoreIapInput) -> str:
         if not (params.app_id and params.key_id and params.issuer_id and params.private_key_path):
             raise ValueError("All App Store credentials are required when app is not set for credential resolution.")
         r_app_id, r_key_id, r_issuer_id, r_pk = params.app_id, params.key_id, params.issuer_id, params.private_key_path
+
+    products = params.products
+    if not products and params.app:
+        local = _router().service_for(params.project_path).list_section(params.app, "app_store")
+        products = _local_products_to_app_store_list(local.get("products", {}))
+    if not products:
+        raise ValueError("No products to sync. Provide products or configure them locally with perfectdeck_configure_iap.")
+
     client = app_store_api.AppStoreConnectClient.from_key_file(
         key_id=r_key_id,
         issuer_id=r_issuer_id,
@@ -2129,10 +2725,29 @@ def perfectdeck_sync_app_store_iap(params: SyncAppStoreIapInput) -> str:
     out = app_store_api.sync_iap_localizations(
         client=client,
         app_id=r_app_id,
-        products=params.products,
+        products=products,
+        delete_missing=params.delete_missing,
     )
+
+    # Sync pricing for products that have a pricing field
+    products_with_pricing = [p for p in products if p.get("pricing")]
+    if products_with_pricing:
+        pricing_out = app_store_api.sync_iap_pricing(
+            client=client,
+            app_id=r_app_id,
+            products=products_with_pricing,
+        )
+        out["pricing"] = pricing_out
+
     if params.app:
         _persist_app_store_credentials(params.project_path, params.app, r_app_id, r_key_id, r_issuer_id, r_pk)
+        products_dict = {
+            p["product_id"]: {k: v for k, v in p.items() if k != "product_id"}
+            for p in products
+            if p.get("product_id")
+        }
+        if products_dict:
+            _router().service_for(params.project_path).set_products(params.app, "app_store", products_dict)
     return _result(out, "perfectdeck_sync_app_store_iap")
 
 
@@ -2147,7 +2762,12 @@ def perfectdeck_sync_app_store_iap(params: SyncAppStoreIapInput) -> str:
     },
 )
 def perfectdeck_sync_app_store_subscriptions(params: SyncAppStoreSubscriptionsInput) -> str:
-    """Sync subscription localizations to App Store Connect."""
+    """Sync subscription localizations and pricing to App Store Connect.
+
+    When subscriptions is omitted, all subscriptions from the local listing are synced automatically.
+    Set delete_missing=true to remove remote localizations not present in the local listing.
+    Subscriptions that have a ``pricing`` field will have their regional pricing pushed automatically.
+    """
     if params.app:
         r_app_id, r_key_id, r_issuer_id, r_pk = _resolve_app_store_credentials(
             params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path,
@@ -2156,6 +2776,14 @@ def perfectdeck_sync_app_store_subscriptions(params: SyncAppStoreSubscriptionsIn
         if not (params.app_id and params.key_id and params.issuer_id and params.private_key_path):
             raise ValueError("All App Store credentials are required when app is not set for credential resolution.")
         r_app_id, r_key_id, r_issuer_id, r_pk = params.app_id, params.key_id, params.issuer_id, params.private_key_path
+
+    subscriptions = params.subscriptions
+    if not subscriptions and params.app:
+        local = _router().service_for(params.project_path).list_section(params.app, "app_store")
+        subscriptions = _local_products_to_app_store_list(local.get("subscriptions", {}))
+    if not subscriptions:
+        raise ValueError("No subscriptions to sync. Provide subscriptions or configure them locally with perfectdeck_configure_iap.")
+
     client = app_store_api.AppStoreConnectClient.from_key_file(
         key_id=r_key_id,
         issuer_id=r_issuer_id,
@@ -2164,10 +2792,29 @@ def perfectdeck_sync_app_store_subscriptions(params: SyncAppStoreSubscriptionsIn
     out = app_store_api.sync_subscription_localizations(
         client=client,
         app_id=r_app_id,
-        subscriptions=params.subscriptions,
+        subscriptions=subscriptions,
+        delete_missing=params.delete_missing,
     )
+
+    # Sync pricing for subscriptions that have a pricing field
+    subs_with_pricing = [s for s in subscriptions if s.get("pricing")]
+    if subs_with_pricing:
+        pricing_out = app_store_api.sync_subscription_pricing(
+            client=client,
+            app_id=r_app_id,
+            subscriptions=subs_with_pricing,
+        )
+        out["pricing"] = pricing_out
+
     if params.app:
         _persist_app_store_credentials(params.project_path, params.app, r_app_id, r_key_id, r_issuer_id, r_pk)
+        subscriptions_dict = {
+            s["product_id"]: {k: v for k, v in s.items() if k != "product_id"}
+            for s in subscriptions
+            if s.get("product_id")
+        }
+        if subscriptions_dict:
+            _router().service_for(params.project_path).set_products(params.app, "app_store", {}, subscriptions_dict)
     return _result(out, "perfectdeck_sync_app_store_subscriptions")
 
 

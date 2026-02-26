@@ -566,7 +566,7 @@ def _update_release_notes_in_edit(
     package_name: str,
     edit_id: str,
     track: str,
-    version_code: int,
+    version_code: int | None,
     release_notes: Dict[str, str],
 ) -> None:
     """Update release notes for a version code within an existing edit."""
@@ -574,14 +574,17 @@ def _update_release_notes_in_edit(
         edits.tracks().get(packageName=package_name, editId=edit_id, track=track)
     )
     releases = track_resource.get("releases", []) or []
-    version_code_str = str(version_code)
-    target_release = next(
-        (
-            r for r in releases
-            if version_code_str in (r.get("versionCodes") or [])
-        ),
-        None,
-    )
+    if version_code is None:
+        target_release = releases[0] if releases else None
+    else:
+        version_code_str = str(version_code)
+        target_release = next(
+            (
+                r for r in releases
+                if version_code_str in (r.get("versionCodes") or [])
+            ),
+            None,
+        )
     if target_release is None:
         raise RuntimeError(
             f"No release found for version code {version_code} on track {track}."
@@ -608,12 +611,13 @@ def update_release_notes(
     service: Any,
     package_name: str,
     track: str,
-    version_code: int,
+    version_code: int | None,
     release_notes: Dict[str, str],
 ) -> Dict[str, Any]:
     """Standalone: update release notes for a version code on a track.
 
     *release_notes* maps ``{play_locale: text}``.
+    If *version_code* is None, the latest release on the track is used.
     """
     edits = service.edits()
     insert_response = _execute_with_retry(
@@ -830,6 +834,13 @@ def _price_to_money(currency: str, price: float) -> Dict[str, str]:
     return _micro_price_to_money(currency, int(round(price * 1_000_000)))
 
 
+def _price_to_money_proto(currency: str, price: float) -> Dict[str, Any]:
+    """Convert a price to the Money proto format used by the new monetization API."""
+    units = int(price)
+    nanos = int(round((price - units) * 1_000_000_000))
+    return {"currencyCode": currency, "units": str(units), "nanos": nanos}
+
+
 def ensure_managed_products(
     service: Any,
     package_name: str,
@@ -845,67 +856,117 @@ def ensure_managed_products(
             "listings": {
                 "en-US": {"title": "3 Credits", "description": "Buy 3 credits"},
                 ...
+            },
+            # Optional: per-country pricing overrides
+            "pricing": {
+                "GB": {"currency": "GBP", "price": 1.79},
+                "CA": {"currency": "CAD", "price": 2.49},
+                ...
             }
         }
 
-    Returns ``{"ok": True, "created": [...], "updated": [...]}``.
+    Returns ``{"ok": True, "created": [...], "updated": [...], "pricing_applied": {...}}``.
     """
     monetization = service.monetization()
     created: List[str] = []
     updated: List[str] = []
+    pricing_applied: Dict[str, int] = {}
 
     for product in products:
         sku = product["sku"]
         default_price = product.get("default_price", {})
         listings = product.get("listings", {})
 
-        listing_entries = {}
+        # New API uses a list of {languageCode, title, description}
+        listing_entries: List[Dict[str, str]] = []
         for locale, fields in listings.items():
-            entry: Dict[str, str] = {}
+            entry: Dict[str, str] = {"languageCode": locale}
             if fields.get("title"):
                 entry["title"] = fields["title"]
             if fields.get("description"):
                 entry["description"] = fields["description"]
-            if entry:
-                listing_entries[locale] = entry
+            if len(entry) > 1:
+                listing_entries.append(entry)
 
         body: Dict[str, Any] = {
+            "productId": sku,
             "packageName": package_name,
-            "sku": sku,
-            "purchaseType": "managedUser",
             "listings": listing_entries,
-            "status": "active",
         }
 
-        if default_price:
-            body["defaultPrice"] = _price_to_money(
-                default_price.get("currency", "USD"),
-                default_price.get("price", 0),
-            )
+        # Build regionalPricingAndAvailabilityConfigs from regional pricing dict.
+        # Fall back to a single US entry from default_price if no regional map.
+        regional_prices = product.get("pricing") or {}
+        regional_configs: List[Dict[str, Any]] = [
+            {
+                "regionCode": country,
+                "price": _price_to_money_proto(
+                    info.get("currency", "USD"),
+                    info.get("price", 0),
+                ),
+                "availability": "AVAILABLE",
+            }
+            for country, info in regional_prices.items()
+        ]
+        if not regional_configs and default_price:
+            regional_configs = [{
+                "regionCode": "US",
+                "price": _price_to_money_proto(
+                    default_price.get("currency", "USD"),
+                    default_price.get("price", 0),
+                ),
+                "availability": "AVAILABLE",
+            }]
 
-        try:
-            monetization.onetimeproducts().get(
-                packageName=package_name, sku=sku,
-            ).execute()
-            # Product exists → update
-            _execute_with_retry(
-                monetization.onetimeproducts().patch(
-                    packageName=package_name, sku=sku, body=body,
-                )
-            )
-            updated.append(sku)
-        except HttpError as exc:
-            if hasattr(exc, "resp") and exc.resp.status == 404:
-                _execute_with_retry(
-                    monetization.onetimeproducts().insert(
-                        packageName=package_name, body=body,
-                    )
-                )
-                created.append(sku)
-            else:
-                raise
+        if regional_configs:
+            body["purchaseOptions"] = [{
+                "purchaseOptionId": "default",
+                "buyOption": {},
+                "regionalPricingAndAvailabilityConfigs": regional_configs,
+            }]
 
-    return {"ok": True, "created": created, "updated": updated}
+        # patch() with allowMissing=True is an upsert — creates or updates
+        _execute_with_retry(
+            monetization.onetimeproducts().patch(
+                packageName=package_name, productId=sku, body=body,
+                allowMissing=True, updateMask="listings,purchaseOptions",
+                regionsVersion_version="2025/03",
+            )
+        )
+        updated.append(sku)
+        if regional_configs:
+            pricing_applied[sku] = len(regional_configs)
+
+    return {"ok": True, "created": created, "updated": updated, "pricing_applied": pricing_applied}
+
+
+# ---------------------------------------------------------------------------
+# Deactivate / delete products
+# ---------------------------------------------------------------------------
+
+def deactivate_managed_product(
+    service: Any,
+    package_name: str,
+    sku: str,
+) -> Dict[str, Any]:
+    """Set a managed one-time product to inactive on Google Play.
+
+    Google Play does not allow permanent deletion of products via the API once
+    they have been published. Setting status to ``inactive`` hides the product
+    from new buyers while preserving purchase history.
+
+    Returns ``{"ok": True, "sku": str, "status": "inactive"}``.
+    """
+    monetization = service.monetization()
+    current = _execute_with_retry(
+        monetization.onetimeproducts().get(packageName=package_name, productId=sku)
+    )
+    body = dict(current)
+    body["status"] = "INACTIVE"
+    _execute_with_retry(
+        monetization.onetimeproducts().patch(packageName=package_name, productId=sku, body=body)
+    )
+    return {"ok": True, "sku": sku, "status": "inactive"}
 
 
 # ---------------------------------------------------------------------------
@@ -927,22 +988,40 @@ def apply_regional_pricing(
     monetization = service.monetization()
 
     current = _execute_with_retry(
-        monetization.onetimeproducts().get(packageName=package_name, sku=sku)
+        monetization.onetimeproducts().get(packageName=package_name, productId=sku)
     )
-    prices = current.get("prices", {})
+
+    # Build a lookup of existing regional configs from the default purchase option
+    po_list: List[Dict[str, Any]] = current.get("purchaseOptions") or []
+    if not po_list:
+        po_list = [{"purchaseOptionId": "default", "buyOption": {}}]
+    default_po = next(
+        (po for po in po_list if po.get("purchaseOptionId") == "default"),
+        po_list[0],
+    )
+    existing_configs: Dict[str, Dict[str, Any]] = {
+        cfg["regionCode"]: cfg
+        for cfg in default_po.get("regionalPricingAndAvailabilityConfigs", [])
+        if cfg.get("regionCode")
+    }
 
     for country, price_info in regional_prices.items():
-        prices[country] = _price_to_money(
-            price_info.get("currency", "USD"),
-            price_info.get("price", 0),
-        )
+        existing_configs[country] = {
+            "regionCode": country,
+            "price": _price_to_money_proto(
+                price_info.get("currency", "USD"),
+                price_info.get("price", 0),
+            ),
+            "availability": "AVAILABLE",
+        }
 
-    body = dict(current)
-    body["prices"] = prices
+    default_po["regionalPricingAndAvailabilityConfigs"] = list(existing_configs.values())
+    current["purchaseOptions"] = po_list
 
     _execute_with_retry(
         monetization.onetimeproducts().patch(
-            packageName=package_name, sku=sku, body=body,
+            packageName=package_name, productId=sku, body=current,
+            updateMask="purchaseOptions", regionsVersion_version="2025/03",
         )
     )
     return {"ok": True, "sku": sku, "regions_applied": len(regional_prices)}
