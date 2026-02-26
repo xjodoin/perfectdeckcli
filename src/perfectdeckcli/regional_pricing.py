@@ -29,6 +29,9 @@ PRICING_TIERS: dict[str, dict] = {
             "US", "CA", "GB", "DE", "FR", "AU", "NL", "SE", "NO", "CH",
             "DK", "FI", "AT", "BE", "IE", "LU", "SG", "NZ", "IL", "AE",
             "QA", "KW", "BH", "IS",
+            # Small wealthy territories
+            "BM", "KY", "LI", "MC", "SM", "VA", "GI", "MO", "BS", "VG",
+            "TC", "AW", "SC", "MU",
         ],
     },
     "tier2": {
@@ -38,6 +41,9 @@ PRICING_TIERS: dict[str, dict] = {
             "ES", "IT", "PT", "KR", "JP", "TW", "HK", "CZ", "SK", "SI",
             "EE", "LT", "LV", "HR", "MT", "CY", "SA", "OM", "CL", "UY",
             "PA", "CR",
+            # Upper-middle Caribbean & others
+            "TT", "AG", "DM", "GD", "KN", "LC", "BW", "NA", "FJ",
+            "MV",
         ],
     },
     "tier3": {
@@ -48,6 +54,9 @@ PRICING_TIERS: dict[str, dict] = {
             "TH", "MY", "TR", "ZA", "RU", "UA", "KZ", "RS", "BA", "MK",
             "AL", "MD", "BY", "AZ", "GE", "AM", "JO", "LB", "DO", "EC",
             "GT", "SV", "HN", "NI", "BO", "PY",
+            # Middle-income additions
+            "JM", "SR", "BZ", "VE", "CV", "GA", "CG", "LY", "WS", "TO",
+            "VU", "FM",
         ],
     },
     "tier4": {
@@ -58,12 +67,18 @@ PRICING_TIERS: dict[str, dict] = {
             "GH", "TZ", "UG", "SN", "CI", "CM", "ZW", "ZM", "MZ", "AO",
             "LK", "BD", "NP", "MM", "KH", "LA", "MN", "UZ", "TM", "TJ",
             "KG", "IQ", "PK",
+            # Lower-middle additions
+            "PG", "SB", "GM", "GN", "YE", "KM",
         ],
     },
     "tier5": {
         "name": "Emerging Markets",
         "multiplier": 0.25,
-        "countries": ["RW", "BF", "ML", "NE", "TG", "BJ", "HT"],
+        "countries": [
+            "RW", "BF", "ML", "NE", "TG", "BJ", "HT",
+            # Emerging additions
+            "CD", "CF", "TD", "DJ", "ER", "GW", "LR", "SL", "SO",
+        ],
     },
 }
 
@@ -72,6 +87,11 @@ COUNTRY_CURRENCY: dict[str, str] = {
     # Americas
     "US": "USD", "CA": "CAD", "MX": "MXN", "BR": "BRL",
     "CL": "CLP", "CO": "COP", "PE": "PEN", "PY": "PYG", "BO": "BOB", "CR": "CRC",
+    # Caribbean & small Americas (USD on Play Store)
+    "BM": "USD", "KY": "USD", "BS": "USD", "VG": "USD", "TC": "USD",
+    "AW": "USD", "AG": "USD", "DM": "USD", "GD": "USD",
+    "KN": "USD", "LC": "USD", "TT": "USD", "JM": "USD", "SR": "USD",
+    "BZ": "USD", "VE": "USD", "FM": "USD",
     # Europe – EUR (incl. non-EU that use EUR on Play Store, e.g. IS, BG joined 2025)
     "DE": "EUR", "FR": "EUR", "NL": "EUR", "AT": "EUR", "BE": "EUR",
     "IE": "EUR", "LU": "EUR", "FI": "EUR", "ES": "EUR", "IT": "EUR",
@@ -81,6 +101,8 @@ COUNTRY_CURRENCY: dict[str, str] = {
     # West/Central Africa – EUR on Play Store
     "BF": "EUR", "BJ": "EUR", "CF": "EUR", "GA": "EUR",
     "GW": "EUR", "ML": "EUR", "NE": "EUR", "TG": "EUR",
+    # Central Africa
+    "CG": "USD", "TD": "USD", "CD": "USD",
     # Europe – non-EUR
     "GB": "GBP", "GI": "GBP",
     "SE": "SEK", "NO": "NOK", "DK": "DKK",
@@ -91,12 +113,20 @@ COUNTRY_CURRENCY: dict[str, str] = {
     "MO": "MOP", "TW": "TWD", "SG": "SGD", "TH": "THB", "MY": "MYR",
     "ID": "IDR", "PH": "PHP", "VN": "VND", "IN": "INR",
     "PK": "PKR", "BD": "BDT", "LK": "LKR", "MM": "MMK", "MN": "MNT",
+    # APAC – small states (USD on Play Store)
+    "FJ": "USD", "PG": "USD", "SB": "USD", "WS": "USD", "TO": "USD",
+    "VU": "USD", "MV": "USD",
     # MENA – local currency
     "AE": "AED", "SA": "SAR", "TR": "TRY", "IL": "ILS",
     "QA": "QAR", "EG": "EGP", "JO": "JOD", "IQ": "IQD", "MA": "MAD", "DZ": "DZD",
+    "LY": "USD", "YE": "USD",
     # Africa – local currency
     "ZA": "ZAR", "NG": "NGN", "KE": "KES", "GH": "GHS", "TZ": "TZS",
     "CI": "XOF", "SN": "XOF", "CM": "XAF",
+    # Africa – additional
+    "BW": "USD", "NA": "USD", "MU": "USD", "SC": "USD", "CV": "USD",
+    "GM": "USD", "GN": "USD", "KM": "USD", "LR": "USD", "SL": "USD",
+    "SO": "USD", "DJ": "USD", "ER": "USD",
     # Post-Soviet – local currency
     "RU": "RUB", "UA": "UAH", "KZ": "KZT", "GE": "GEL",
     # Rest fall back to USD (KW, BH, OM, AR, AM, AZ, BY, AL, BA, MK,
@@ -135,15 +165,25 @@ ZERO_DECIMAL_CURRENCIES: set[str] = {
 }
 
 
-def _round_up_to_99(price: float) -> float:
-    """Round upward to a .99 ending for currencies with fractional pricing."""
+def _round_to_99_threshold(price: float) -> float:
+    """Round to ``.99`` using a ``.50`` fractional threshold.
+
+    Rules:
+    - fractional part ``< .50``: previous ``.99`` (e.g. ``2.30 -> 1.99``)
+    - fractional part ``>= .50``: next ``.99`` (e.g. ``2.54 -> 2.99``)
+    """
     if price <= 0:
         return 0.99
-    whole = int(price)
-    candidate = whole + 0.99
-    if candidate < price:
-        candidate = whole + 1.99
-    return round(candidate, 2)
+
+    whole = int(math.floor(price))
+    fractional = price - whole
+
+    if fractional < 0.50:
+        candidate = (whole - 1) + 0.99
+    else:
+        candidate = whole + 0.99
+
+    return round(max(0.99, candidate), 2)
 
 
 def fetch_live_rates(timeout: float = _FETCH_TIMEOUT) -> dict[str, float]:
@@ -249,37 +289,50 @@ APP_STORE_TERRITORY: dict[str, str] = {
     "LK": "LKA", "MM": "MMR", "ET": "ETH", "RW": "RWA", "GH": "GHA",
     "TZ": "TZA", "SN": "SEN", "CI": "CIV", "KH": "KHM", "LA": "LAO",
     "MN": "MNG", "UZ": "UZB",
+    # Additional territories
+    "BM": "BMU", "KY": "CYM", "LI": "LIE", "MC": "MCO", "SM": "SMR",
+    "VA": "VAT", "GI": "GIB", "MO": "MAC", "BS": "BHS", "VG": "VGB",
+    "TC": "TCA", "AW": "ABW", "SC": "SYC", "MU": "MUS",
+    "TT": "TTO", "AG": "ATG", "DM": "DMA", "GD": "GRD", "KN": "KNA",
+    "LC": "LCA", "BW": "BWA", "NA": "NAM", "FJ": "FJI", "MV": "MDV",
+    "JM": "JAM", "SR": "SUR", "BZ": "BLZ", "VE": "VEN", "CV": "CPV",
+    "GA": "GAB", "CG": "COG", "LY": "LBY", "WS": "WSM", "TO": "TON",
+    "VU": "VUT", "FM": "FSM", "PG": "PNG", "SB": "SLB", "GM": "GMB",
+    "GN": "GIN", "YE": "YEM", "KM": "COM", "CD": "COD", "CF": "CAF",
+    "TD": "TCD", "DJ": "DJI", "ER": "ERI", "GW": "GNB", "LR": "LBR",
+    "SL": "SLE", "SO": "SOM",
 }
 
 
 def snap_to_price_point(price: float, currency: str) -> float:
-    """Snap to an allowed store price point, rounding upward.
+    """Snap to an allowed store price point.
 
-    For currencies with explicit store grids, this uses the lowest valid point
-    that is not below the target price, and prefers ``.99`` cent endings when
-    available at or above that target.
+    For currencies with explicit store grids, this prefers ``.99`` endings
+    using the ``.50`` threshold rule:
+    - fractional ``< .50``: previous ``.99``
+    - fractional ``>= .50``: next ``.99``
     """
     points = PRICE_POINTS.get(currency)
     if points:
         ordered = sorted(points)
         if price <= ordered[0]:
             return ordered[0]
+        ninety_nine = sorted(
+            p for p in ordered if int(round((p - int(p)) * 100)) == 99
+        )
+        if ninety_nine:
+            target = _round_to_99_threshold(price)
+            return min(ninety_nine, key=lambda p: abs(p - target))
+
         upward = [p for p in ordered if p >= price]
         if not upward:
             return ordered[-1]
-
-        # Prefer psychological ".99" endings if that price point exists above target.
-        ninety_nine = [
-            p for p in upward if int(round((p - int(p)) * 100)) == 99
-        ]
-        if ninety_nine:
-            return ninety_nine[0]
         return upward[0]
     # For currencies without a defined price grid, avoid falling back to USD points
     # (which gives wrong magnitudes). Keep no-cent currencies whole-number only.
     if currency in ZERO_DECIMAL_CURRENCIES:
         return float(max(0, math.ceil(price)))
-    return _round_up_to_99(price)
+    return _round_to_99_threshold(price)
 
 
 def calculate_regional_prices(

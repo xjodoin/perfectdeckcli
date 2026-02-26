@@ -2242,11 +2242,15 @@ def perfectdeck_sync_play_products(params: SyncPlayProductsInput) -> str:
     )
     if params.app:
         _persist_play_credentials(params.project_path, params.app, pkg, creds)
-        products_dict = {
-            p["sku"]: {k: v for k, v in p.items() if k != "sku"}
-            for p in products
-            if p.get("sku")
-        }
+        products_dict = {}
+        for p in products:
+            if not p.get("sku"):
+                continue
+            entry = {k: v for k, v in p.items() if k != "sku"}
+            # Normalize Play API "listings" back to local "localizations" key
+            if "listings" in entry:
+                entry["localizations"] = entry.pop("listings")
+            products_dict[p["sku"]] = entry
         if products_dict:
             _router().service_for(params.project_path).set_products(params.app, "play", products_dict)
     return _result(out, "perfectdeck_sync_play_products")
@@ -2524,8 +2528,9 @@ def _local_products_to_play_list(products: dict[str, Any]) -> list[dict[str, Any
         entry: dict[str, Any] = {"sku": sku}
         if "default_price" in cfg:
             entry["default_price"] = cfg["default_price"]
-        if "listings" in cfg:
-            entry["listings"] = cfg["listings"]
+        # Local listing uses "localizations"; Play API expects "listings"
+        if "localizations" in cfg:
+            entry["listings"] = cfg["localizations"]
         if "pricing" in cfg:
             entry["pricing"] = cfg["pricing"]
         result.append(entry)
@@ -2647,7 +2652,20 @@ def perfectdeck_set_iap_pricing_tiers(params: SetIapPricingTiersInput) -> str:
         )
         pricing_data[product_id] = {"pricing": regional}
 
-    svc.set_products(params.app, params.store, pricing_data, merge=True)
+    # Split pricing between products and subscriptions based on existing listing
+    section = svc.list_section(params.app, params.store)
+    existing_subs = section.get("subscriptions", {})
+    sub_pricing: dict[str, Any] = {}
+    prod_pricing: dict[str, Any] = {}
+    for pid, pdata in pricing_data.items():
+        if pid in existing_subs:
+            sub_pricing[pid] = pdata
+        else:
+            prod_pricing[pid] = pdata
+    if prod_pricing:
+        svc.set_products(params.app, params.store, prod_pricing, merge=True)
+    if sub_pricing:
+        svc.set_products(params.app, params.store, {}, subscriptions=sub_pricing, merge=True)
 
     country_count = len(next(iter(pricing_data.values()))["pricing"]) if pricing_data else 0
     return _result(

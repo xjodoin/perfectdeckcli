@@ -918,12 +918,54 @@ def ensure_managed_products(
                 "availability": "AVAILABLE",
             }]
 
+        # Merge regional pricing into existing purchase options. Prefer
+        # "legacy-base" (backwards compatible, used by existing apps) over
+        # "default". Preserve all existing purchase options and newRegionsConfig.
         if regional_configs:
-            body["purchaseOptions"] = [{
-                "purchaseOptionId": "default",
-                "buyOption": {},
-                "regionalPricingAndAvailabilityConfigs": regional_configs,
-            }]
+            new_by_region = {c["regionCode"]: c for c in regional_configs}
+            target_po_id = "default"
+            existing_pos: List[Dict[str, Any]] = []
+            try:
+                existing = _execute_with_retry(
+                    monetization.onetimeproducts().get(
+                        packageName=package_name, productId=sku,
+                    )
+                )
+                existing_pos = existing.get("purchaseOptions", [])
+                # Find the target purchase option: prefer legacy-base
+                for po in existing_pos:
+                    if po.get("purchaseOptionId") == "legacy-base":
+                        target_po_id = "legacy-base"
+                        break
+            except Exception:
+                pass  # Product doesn't exist yet
+
+            # Build merged purchase options list
+            updated_pos: List[Dict[str, Any]] = []
+            target_found = False
+            for po in existing_pos:
+                if po.get("purchaseOptionId") == target_po_id:
+                    target_found = True
+                    # Merge existing regions not in our new pricing
+                    for cfg in po.get("regionalPricingAndAvailabilityConfigs", []):
+                        region = cfg.get("regionCode")
+                        if region and region not in new_by_region:
+                            new_by_region[region] = cfg
+                    po["regionalPricingAndAvailabilityConfigs"] = list(new_by_region.values())
+                    updated_pos.append(po)
+                else:
+                    updated_pos.append(po)
+
+            if not target_found:
+                # No existing product — create a new purchase option
+                po_entry: Dict[str, Any] = {
+                    "purchaseOptionId": target_po_id,
+                    "buyOption": {"legacyCompatible": True},
+                    "regionalPricingAndAvailabilityConfigs": list(new_by_region.values()),
+                }
+                updated_pos.append(po_entry)
+
+            body["purchaseOptions"] = updated_pos
 
         # patch() with allowMissing=True is an upsert — creates or updates
         _execute_with_retry(
@@ -991,13 +1033,18 @@ def apply_regional_pricing(
         monetization.onetimeproducts().get(packageName=package_name, productId=sku)
     )
 
-    # Build a lookup of existing regional configs from the default purchase option
+    # Find the active/legacy purchase option to update pricing on.
+    # Prefer "legacy-base" (backwards compatible) over "default" since
+    # existing apps use the legacy purchase flow.
     po_list: List[Dict[str, Any]] = current.get("purchaseOptions") or []
     if not po_list:
         po_list = [{"purchaseOptionId": "default", "buyOption": {}}]
     default_po = next(
-        (po for po in po_list if po.get("purchaseOptionId") == "default"),
-        po_list[0],
+        (po for po in po_list if po.get("purchaseOptionId") == "legacy-base"),
+        next(
+            (po for po in po_list if po.get("purchaseOptionId") == "default"),
+            po_list[0],
+        ),
     )
     existing_configs: Dict[str, Dict[str, Any]] = {
         cfg["regionCode"]: cfg
@@ -1062,7 +1109,7 @@ def apply_subscription_regional_pricing(
     existing_regions = {rc.get("regionCode"): rc for rc in regional_configs}
 
     for region, price_info in regional_prices.items():
-        money = _price_to_money(
+        money = _price_to_money_proto(
             price_info.get("currency", "USD"),
             price_info.get("price", 0),
         )
@@ -1076,6 +1123,8 @@ def apply_subscription_regional_pricing(
             packageName=package_name,
             productId=subscription_id,
             body=current,
+            updateMask="basePlans",
+            regionsVersion_version="2025/03",
         )
     )
     return {"ok": True, "subscription_id": subscription_id, "regions_applied": len(regional_prices)}

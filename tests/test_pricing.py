@@ -34,17 +34,27 @@ class TestSnapToPricePoint:
     def test_exact_match_returns_same(self):
         assert snap_to_price_point(0.99, "USD") == 0.99
 
-    def test_rounds_up_and_prefers_99_cents(self):
-        # 1.20 in USD rounds upward and prefers .99 when available.
+    def test_rounds_to_previous_99_when_fraction_below_half(self):
+        # Fractional part < .50 rounds to the previous .99.
         result = snap_to_price_point(1.20, "USD")
+        assert result in PRICE_POINTS["USD"]
+        assert result == 0.99
+
+    def test_rounds_to_next_99_when_fraction_above_half(self):
+        # Fractional part > .50 rounds to the next .99.
+        result = snap_to_price_point(2.54, "USD")
+        assert result in PRICE_POINTS["USD"]
+        assert result == 2.99
+
+    def test_rounds_to_previous_99_for_mid_price_example(self):
+        result = snap_to_price_point(2.30, "USD")
         assert result in PRICE_POINTS["USD"]
         assert result == 1.99
 
-    def test_rounds_up_to_next_99_cents(self):
-        # 1.30 in USD rounds upward and prefers .99 when available.
-        result = snap_to_price_point(1.30, "USD")
+    def test_rounds_to_next_99_when_fraction_is_exactly_half(self):
+        result = snap_to_price_point(2.50, "USD")
         assert result in PRICE_POINTS["USD"]
-        assert result == 1.99
+        assert result == 2.99
 
     def test_rounds_up_without_99_fallback(self):
         # SGD grid uses .98 endings, so we pick the next valid upward point.
@@ -64,9 +74,9 @@ class TestSnapToPricePoint:
             result = snap_to_price_point(2.0, currency)
             assert result in PRICE_POINTS[currency], f"Snapped price not in {currency} grid"
 
-    def test_unknown_fractional_currency_rounds_up_to_99(self):
+    def test_unknown_fractional_currency_uses_50_cent_threshold(self):
         result = snap_to_price_point(1.20, "XYZ")
-        assert result == 1.99
+        assert result == 0.99
 
     def test_unknown_zero_decimal_currency_rounds_to_whole_number(self):
         result = snap_to_price_point(7.36, "XOF")

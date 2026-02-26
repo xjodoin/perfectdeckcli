@@ -107,7 +107,7 @@ class AppStoreConnectClient:
     ) -> Mapping[str, Any]:
         """Send an authenticated request with automatic retry for transient errors."""
         # Support paths with explicit API version (e.g. /v2/...)
-        if path.startswith("/v2/") or path.startswith("/v3/"):
+        if path.startswith("/v1/") or path.startswith("/v2/") or path.startswith("/v3/"):
             base_domain = self.base_url.rsplit("/v", 1)[0]
             url = f"{base_domain}{path}"
         else:
@@ -870,9 +870,11 @@ class AppStoreConnectClient:
         *pricing* maps ``{territory_3letter: {currency, price}}``.
 
         Fetches available price points, snaps each requested price, then
-        replaces existing prices for those territories (DELETE then POST).
+        creates or updates prices per territory.  For approved subscriptions
+        the initial price cannot be re-created, so we skip territories that
+        already have pricing and only add new ones.
 
-        Returns ``{"territories_set": int, "territories_skipped": [...]}``.
+        Returns ``{"territories_set": int, "territories_skipped": [...], "already_set": int}``.
         """
         territories = list(pricing.keys())
         price_points = self._fetch_price_points_paginated(
@@ -880,25 +882,44 @@ class AppStoreConnectClient:
             territories=territories,
         )
 
-        # Fetch existing prices so we can delete them first
-        existing_resp = self.request(
-            "GET",
-            f"/v1/subscriptions/{subscription_id}/prices",
-            params={"include": "subscriptionPricePoint,territory", "limit": "200"},
-        )
-        existing_by_territory: Dict[str, str] = {}  # territory_id → price resource id
-        for item in existing_resp.get("data", []):
-            price_id = item.get("id")
-            territory_id = (
-                item.get("relationships", {})
-                .get("territory", {})
-                .get("data", {})
-                .get("id", "")
-            )
-            if price_id and territory_id:
-                existing_by_territory[territory_id] = price_id
+        # Fetch existing prices to know which territories already have pricing
+        existing_by_territory: Dict[str, str] = {}  # territory_id → price_point_id
+        existing_price_ids: Dict[str, str] = {}  # territory_id → price resource id
+        next_path: str | None = f"/v1/subscriptions/{subscription_id}/prices"
+        next_params: Dict[str, str] | None = {
+            "include": "subscriptionPricePoint,territory",
+            "limit": "200",
+        }
+        base_domain = self.base_url.rsplit("/v", 1)[0]
+        while next_path:
+            existing_resp = self.request("GET", next_path, params=next_params)
+            for item in existing_resp.get("data", []):
+                price_id = item.get("id")
+                territory_id = (
+                    item.get("relationships", {})
+                    .get("territory", {})
+                    .get("data", {})
+                    .get("id", "")
+                )
+                pp_id = (
+                    item.get("relationships", {})
+                    .get("subscriptionPricePoint", {})
+                    .get("data", {})
+                    .get("id", "")
+                )
+                if price_id and territory_id:
+                    existing_price_ids[territory_id] = price_id
+                    if pp_id:
+                        existing_by_territory[territory_id] = pp_id
+            next_link = existing_resp.get("links", {}).get("next")
+            if next_link and isinstance(next_link, str) and next_link.startswith(base_domain):
+                next_path = next_link[len(base_domain):]
+                next_params = None
+            else:
+                break
 
         set_count = 0
+        already_set = 0
         not_found: List[str] = []
 
         for territory, price_info in pricing.items():
@@ -910,12 +931,15 @@ class AppStoreConnectClient:
 
             best_pp_id = min(territory_points, key=lambda pp: abs(territory_points[pp] - target_price))
 
-            # Remove existing price for this territory before creating new one
-            if territory in existing_by_territory:
-                try:
-                    self.request("DELETE", f"/v1/subscriptionPrices/{existing_by_territory[territory]}")
-                except RuntimeError:
-                    logger.warning("Could not delete existing subscription price for %s", territory)
+            # Skip if territory already has this exact price point
+            if territory in existing_by_territory and existing_by_territory[territory] == best_pp_id:
+                already_set += 1
+                continue
+
+            # For territories that already have pricing, skip — can't change initial price
+            if territory in existing_price_ids:
+                already_set += 1
+                continue
 
             self.request(
                 "POST",
@@ -937,7 +961,7 @@ class AppStoreConnectClient:
             )
             set_count += 1
 
-        return {"territories_set": set_count, "territories_skipped": not_found}
+        return {"territories_set": set_count, "territories_skipped": not_found, "already_set": already_set}
 
     # ------------------------------------------------------------------
     # In-app purchase management
@@ -1627,6 +1651,7 @@ def sync_subscription_localizations(
     created_count = 0
     updated_count = 0
     deleted_count = 0
+    skipped_count = 0
     missing: List[str] = []
 
     for sub in subscriptions:
@@ -1646,10 +1671,16 @@ def sync_subscription_localizations(
 
             remote = existing.get(locale)
             if remote and remote.get("id"):
-                client.update_subscription_localization(
-                    remote["id"], name=name, description=description,
-                )
-                updated_count += 1
+                try:
+                    client.update_subscription_localization(
+                        remote["id"], name=name, description=description,
+                    )
+                    updated_count += 1
+                except RuntimeError as exc:
+                    if "409" in str(exc) and "UNMODIFIABLE" in str(exc):
+                        skipped_count += 1
+                    else:
+                        raise
             else:
                 client.create_subscription_localization(
                     sub_id, locale, name=name, description=description,
@@ -1667,6 +1698,7 @@ def sync_subscription_localizations(
         "created": created_count,
         "updated": updated_count,
         "deleted": deleted_count,
+        "skipped_active": skipped_count,
         "missing_subscriptions": missing,
     }
 
