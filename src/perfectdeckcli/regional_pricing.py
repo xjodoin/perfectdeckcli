@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import urllib.error
 import urllib.request
 
@@ -127,6 +128,24 @@ EXCHANGE_RATES_TO_USD: dict[str, float] = {
     "MMK": 2100.0, "KHR": 4100.0, "MNT": 3400.0,
 }
 
+# ISO-4217 currencies that do not support fractional minor units.
+ZERO_DECIMAL_CURRENCIES: set[str] = {
+    "BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW", "PYG",
+    "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF",
+}
+
+
+def _round_up_to_99(price: float) -> float:
+    """Round upward to a .99 ending for currencies with fractional pricing."""
+    if price <= 0:
+        return 0.99
+    whole = int(price)
+    candidate = whole + 0.99
+    if candidate < price:
+        candidate = whole + 1.99
+    return round(candidate, 2)
+
+
 def fetch_live_rates(timeout: float = _FETCH_TIMEOUT) -> dict[str, float]:
     """Fetch current USD-based exchange rates from open.er-api.com.
 
@@ -234,15 +253,33 @@ APP_STORE_TERRITORY: dict[str, str] = {
 
 
 def snap_to_price_point(price: float, currency: str) -> float:
-    """Round to nearest valid store price point for the given currency."""
+    """Snap to an allowed store price point, rounding upward.
+
+    For currencies with explicit store grids, this uses the lowest valid point
+    that is not below the target price, and prefers ``.99`` cent endings when
+    available at or above that target.
+    """
     points = PRICE_POINTS.get(currency)
     if points:
-        return min(points, key=lambda p: abs(p - price))
-    # For currencies without a defined price grid, round to sensible precision
-    # rather than falling back to USD price points (which gives wrong magnitudes).
-    if price >= 10:
-        return round(price)
-    return round(price * 100) / 100  # 2 decimal places
+        ordered = sorted(points)
+        if price <= ordered[0]:
+            return ordered[0]
+        upward = [p for p in ordered if p >= price]
+        if not upward:
+            return ordered[-1]
+
+        # Prefer psychological ".99" endings if that price point exists above target.
+        ninety_nine = [
+            p for p in upward if int(round((p - int(p)) * 100)) == 99
+        ]
+        if ninety_nine:
+            return ninety_nine[0]
+        return upward[0]
+    # For currencies without a defined price grid, avoid falling back to USD points
+    # (which gives wrong magnitudes). Keep no-cent currencies whole-number only.
+    if currency in ZERO_DECIMAL_CURRENCIES:
+        return float(max(0, math.ceil(price)))
+    return _round_up_to_99(price)
 
 
 def calculate_regional_prices(

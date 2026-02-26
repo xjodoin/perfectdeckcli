@@ -18,6 +18,7 @@ from perfectdeckcli.regional_pricing import (
     PRICE_POINTS,
     PRICING_TIERS,
     APP_STORE_TERRITORY,
+    ZERO_DECIMAL_CURRENCIES,
     _effective_rates,
     calculate_regional_prices,
     snap_to_price_point,
@@ -33,17 +34,22 @@ class TestSnapToPricePoint:
     def test_exact_match_returns_same(self):
         assert snap_to_price_point(0.99, "USD") == 0.99
 
-    def test_rounds_to_nearest_below(self):
-        # 1.20 is between 0.99 and 1.49 in USD → nearest is 0.99
+    def test_rounds_up_and_prefers_99_cents(self):
+        # 1.20 in USD rounds upward and prefers .99 when available.
         result = snap_to_price_point(1.20, "USD")
         assert result in PRICE_POINTS["USD"]
-        assert result == 0.99
+        assert result == 1.99
 
-    def test_rounds_to_nearest_above(self):
-        # 1.30 is between 0.99 and 1.49 in USD → nearest is 1.49
+    def test_rounds_up_to_next_99_cents(self):
+        # 1.30 in USD rounds upward and prefers .99 when available.
         result = snap_to_price_point(1.30, "USD")
         assert result in PRICE_POINTS["USD"]
-        assert result == 1.49
+        assert result == 1.99
+
+    def test_rounds_up_without_99_fallback(self):
+        # SGD grid uses .98 endings, so we pick the next valid upward point.
+        result = snap_to_price_point(1.20, "SGD")
+        assert result == 1.48
 
     def test_below_first_point_snaps_to_first(self):
         result = snap_to_price_point(0.01, "USD")
@@ -58,9 +64,13 @@ class TestSnapToPricePoint:
             result = snap_to_price_point(2.0, currency)
             assert result in PRICE_POINTS[currency], f"Snapped price not in {currency} grid"
 
-    def test_unknown_currency_falls_back_to_usd(self):
-        result = snap_to_price_point(0.99, "XYZ")
-        assert result in PRICE_POINTS["USD"]
+    def test_unknown_fractional_currency_rounds_up_to_99(self):
+        result = snap_to_price_point(1.20, "XYZ")
+        assert result == 1.99
+
+    def test_unknown_zero_decimal_currency_rounds_to_whole_number(self):
+        result = snap_to_price_point(7.36, "XOF")
+        assert result == 8.0
 
     def test_result_is_always_a_valid_point(self):
         for price in [0.5, 1.0, 2.5, 5.0, 9.99, 15.0]:
@@ -307,8 +317,16 @@ class TestCalculateRegionalPrices:
         for country, entry in result.items():
             currency = entry["currency"]
             price = entry["price"]
-            grid = PRICE_POINTS.get(currency, PRICE_POINTS["USD"])
-            assert price in grid, f"{country}/{currency} price {price} not in grid {grid}"
+            grid = PRICE_POINTS.get(currency)
+            if grid:
+                assert price in grid, f"{country}/{currency} price {price} not in grid {grid}"
+            elif currency in ZERO_DECIMAL_CURRENCIES:
+                assert price == round(price), f"{country}/{currency} expected whole-number fallback, got {price}"
+            else:
+                cents = int(round((price - int(price)) * 100))
+                assert cents == 99, (
+                    f"{country}/{currency} expected .99 fallback pricing, got {price}"
+                )
 
     # -- app_store territory mapping --
 
