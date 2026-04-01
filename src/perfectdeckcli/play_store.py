@@ -861,9 +861,9 @@ def _upsert_purchase_options_with_pricing(
 ) -> List[Dict[str, Any]]:
     """Update the ``default`` purchase option with merged regional pricing.
 
-    Applies pricing only to the ``default`` purchase option.  If no ``default``
-    exists, one is created with ``legacyCompatible: true``.  All other purchase
-    options (including ``legacy-base``) are preserved unchanged.
+    Applies pricing only to the ``default`` purchase option. If no ``default``
+    exists, one is created with ``legacyCompatible: true``. Other purchase
+    options, including ``legacy-base``, are preserved unchanged.
     """
     updated_pos: List[Dict[str, Any]] = []
     default_found = False
@@ -877,7 +877,6 @@ def _upsert_purchase_options_with_pricing(
                 po.get("regionalPricingAndAvailabilityConfigs", []),
                 new_by_region,
             )
-            # Ensure default is legacy compatible
             buy_option = dict(po_copy.get("buyOption") or {})
             buy_option["legacyCompatible"] = True
             po_copy["buyOption"] = buy_option
@@ -886,11 +885,13 @@ def _upsert_purchase_options_with_pricing(
             updated_pos.append(po)
 
     if not default_found:
-        updated_pos.append({
-            "purchaseOptionId": "default",
-            "buyOption": {"legacyCompatible": True},
-            "regionalPricingAndAvailabilityConfigs": list(new_by_region.values()),
-        })
+        updated_pos.append(
+            {
+                "purchaseOptionId": "default",
+                "buyOption": {"legacyCompatible": True},
+                "regionalPricingAndAvailabilityConfigs": list(new_by_region.values()),
+            }
+        )
 
     return updated_pos
 
@@ -973,8 +974,7 @@ def ensure_managed_products(
                 "availability": "AVAILABLE",
             }]
 
-        # Merge regional pricing into both "legacy-base" and "default"
-        # purchase options so both purchase flows stay in sync.
+        # Merge regional pricing into the default purchase option used for syncs.
         if regional_configs:
             new_by_region = {c["regionCode"]: c for c in regional_configs}
             existing_pos: List[Dict[str, Any]] = []
@@ -1063,7 +1063,7 @@ def apply_regional_pricing(
         monetization.onetimeproducts().get(packageName=package_name, productId=sku)
     )
 
-    # Update regional pricing on the "default" purchase option.
+    # Update regional pricing on the default purchase option used for syncs.
     po_list: List[Dict[str, Any]] = current.get("purchaseOptions") or []
     new_by_region: Dict[str, Dict[str, Any]] = {}
     for country, price_info in regional_prices.items():

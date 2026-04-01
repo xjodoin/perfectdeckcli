@@ -4,6 +4,23 @@ version = "0.1.0"
 description = "Hybrid CLI + MCP tool to manage App Store and Play Store listing data."
 readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Xavier Jodoin", email = "xavier.jodoin@greybox.biz" },
+]
+keywords = ["app-store", "google-play", "mcp", "cli", "localization", "pricing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Localization",
+  "Topic :: Utilities",
+]
 dependencies = [
   "mcp>=1.13.0",
   "pydantic>=2.8.0",
@@ -14,6 +31,12 @@ dependencies = [
   "cryptography>=3.0.0",
   "requests>=2.28.0",
   "jq>=1.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2.2",
+  "pytest>=9.0.0",
 ]
 
 [project.scripts]
