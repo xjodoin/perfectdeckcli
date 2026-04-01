@@ -21,6 +21,7 @@ from perfectdeckcli.regional_pricing import (
     ZERO_DECIMAL_CURRENCIES,
     _effective_rates,
     calculate_regional_prices,
+    calculate_regional_prices_for_products,
     snap_to_price_point,
 )
 
@@ -34,22 +35,20 @@ class TestSnapToPricePoint:
     def test_exact_match_returns_same(self):
         assert snap_to_price_point(0.99, "USD") == 0.99
 
-    def test_rounds_to_previous_99_when_fraction_below_half(self):
-        # Fractional part < .50 rounds to the previous .99.
+    def test_rounds_up_to_next_99_when_fraction_below_half(self):
         result = snap_to_price_point(1.20, "USD")
         assert result in PRICE_POINTS["USD"]
-        assert result == 0.99
+        assert result == 1.99
 
     def test_rounds_to_next_99_when_fraction_above_half(self):
-        # Fractional part > .50 rounds to the next .99.
         result = snap_to_price_point(2.54, "USD")
         assert result in PRICE_POINTS["USD"]
         assert result == 2.99
 
-    def test_rounds_to_previous_99_for_mid_price_example(self):
+    def test_rounds_up_to_next_99_for_mid_price_example(self):
         result = snap_to_price_point(2.30, "USD")
         assert result in PRICE_POINTS["USD"]
-        assert result == 1.99
+        assert result == 2.99
 
     def test_rounds_to_next_99_when_fraction_is_exactly_half(self):
         result = snap_to_price_point(2.50, "USD")
@@ -76,7 +75,7 @@ class TestSnapToPricePoint:
 
     def test_unknown_fractional_currency_uses_50_cent_threshold(self):
         result = snap_to_price_point(1.20, "XYZ")
-        assert result == 0.99
+        assert result == 1.99
 
     def test_unknown_zero_decimal_currency_rounds_to_whole_number(self):
         result = snap_to_price_point(7.36, "XOF")
@@ -234,6 +233,21 @@ class TestCalculateRegionalPrices:
         assert "DE" in result
         assert result["DE"]["currency"] == "EUR"
 
+    def test_ca_preserves_099_nominal_price_near_parity(self):
+        result = self._calc(base_usd=0.99, store="play", countries=["CA"])
+        assert result["CA"]["currency"] == "CAD"
+        assert result["CA"]["price"] == 0.99
+
+    def test_de_preserves_099_nominal_price_near_parity(self):
+        result = self._calc(base_usd=0.99, store="play", countries=["DE"])
+        assert result["DE"]["currency"] == "EUR"
+        assert result["DE"]["price"] == 0.99
+
+    def test_aud_does_not_preserve_nominal_price_outside_parity_band(self):
+        result = self._calc(base_usd=0.99, store="play", countries=["AU"])
+        assert result["AU"]["currency"] == "AUD"
+        assert result["AU"]["price"] == 1.99
+
     # -- tier multipliers reduce price --
 
     def test_tier4_price_less_than_tier1(self):
@@ -354,6 +368,56 @@ class TestCalculateRegionalPrices:
 
 
 # ===========================================================================
+# calculate_regional_prices_for_products
+# ===========================================================================
+
+
+class TestCalculateRegionalPricesForProducts:
+    def test_bundle_group_keeps_non_increasing_price_per_unit(self):
+        products = {
+            "credits_10": {"base_usd": 1.99, "units": 10, "value_group": "credits"},
+            "credits_25": {"base_usd": 3.99, "units": 25, "value_group": "credits"},
+            "credits_50": {"base_usd": 6.99, "units": 50, "value_group": "credits"},
+        }
+        result = calculate_regional_prices_for_products(
+            products=products,
+            store="play",
+            live_rates=False,
+            countries=["US", "GB", "CA", "ES", "RU"],
+        )
+
+        for country in ["US", "GB", "CA", "ES", "RU"]:
+            ratios = [
+                result["credits_10"][country]["price"] / 10,
+                result["credits_25"][country]["price"] / 25,
+                result["credits_50"][country]["price"] / 50,
+            ]
+            assert ratios[0] >= ratios[1] >= ratios[2], f"{country} ratios out of order: {ratios}"
+
+    def test_products_without_units_are_priced_independently(self):
+        products = {
+            "one_off": {"base_usd": 1.99},
+            "bundle": {"base_usd": 3.99, "units": 25, "value_group": "credits"},
+        }
+        result = calculate_regional_prices_for_products(
+            products=products,
+            store="play",
+            live_rates=False,
+            countries=["US"],
+        )
+        assert result["one_off"]["US"]["price"] == snap_to_price_point(1.99, "USD")
+        assert "US" in result["bundle"]
+
+    def test_invalid_units_raise(self):
+        with pytest.raises(ValueError, match="invalid 'units'"):
+            calculate_regional_prices_for_products(
+                products={"bad": {"base_usd": 1.99, "units": 0}},
+                store="play",
+                live_rates=False,
+            )
+
+
+# ===========================================================================
 # _expand_pricing_tiers (mcp_server helper)
 # ===========================================================================
 
@@ -416,7 +480,6 @@ class TestExpandPricingTiers:
     def test_missing_base_usd_defaults_to_zero(self):
         products = {"prod": {"pricing_tiers": {"live_rates": False}}}
         result = mcp_server._expand_pricing_tiers(products, "play")
-        # base_usd=0.0 → snaps to lowest price point for each currency
         assert "pricing" in result["prod"]
 
     def test_app_store_store_uses_3letter_codes(self):
@@ -432,6 +495,46 @@ class TestExpandPricingTiers:
         result = mcp_server._expand_pricing_tiers(products, "app_store")
         assert "USA" in result["com.app.pro"]["pricing"]
         assert "GBR" in result["com.app.pro"]["pricing"]
+
+    def test_bundle_shorthand_preserves_non_increasing_price_per_unit(self):
+        products = {
+            "credits_10": {
+                "pricing_tiers": {
+                    "base_usd": 1.99,
+                    "units": 10,
+                    "value_group": "credits",
+                    "live_rates": False,
+                    "countries": ["US", "CA", "GB", "ES", "RU"],
+                }
+            },
+            "credits_25": {
+                "pricing_tiers": {
+                    "base_usd": 3.99,
+                    "units": 25,
+                    "value_group": "credits",
+                    "live_rates": False,
+                    "countries": ["US", "CA", "GB", "ES", "RU"],
+                }
+            },
+            "credits_50": {
+                "pricing_tiers": {
+                    "base_usd": 6.99,
+                    "units": 50,
+                    "value_group": "credits",
+                    "live_rates": False,
+                    "countries": ["US", "CA", "GB", "ES", "RU"],
+                }
+            },
+        }
+        result = mcp_server._expand_pricing_tiers(products, "play")
+
+        for country in ["US", "CA", "GB", "ES", "RU"]:
+            ratios = [
+                result["credits_10"]["pricing"][country]["price"] / 10,
+                result["credits_25"]["pricing"][country]["price"] / 25,
+                result["credits_50"]["pricing"][country]["price"] / 50,
+            ]
+            assert ratios[0] >= ratios[1] >= ratios[2], f"{country} ratios out of order: {ratios}"
 
 
 # ===========================================================================
@@ -496,7 +599,7 @@ class TestMcpSetIapPricingTiers:
                 project_path="proj",
                 app="myapp",
                 store="play",
-                product_prices={"com.app.credits_10": 1.99},
+                products={"com.app.credits_10": {"base_usd": 1.99}},
                 live_rates=False,
             )
         ))
@@ -512,7 +615,7 @@ class TestMcpSetIapPricingTiers:
                 project_path="proj",
                 app="myapp",
                 store="app_store",
-                product_prices={"com.app.pro": 4.99},
+                products={"com.app.pro": {"base_usd": 4.99}},
                 live_rates=False,
             )
         ))
@@ -526,10 +629,10 @@ class TestMcpSetIapPricingTiers:
                 project_path="proj",
                 app="myapp",
                 store="play",
-                product_prices={
-                    "com.app.credits_10": 1.99,
-                    "com.app.credits_25": 3.99,
-                    "com.app.credits_50": 6.99,
+                products={
+                    "com.app.credits_10": {"base_usd": 1.99},
+                    "com.app.credits_25": {"base_usd": 3.99},
+                    "com.app.credits_50": {"base_usd": 6.99},
                 },
                 live_rates=False,
             )
@@ -543,7 +646,7 @@ class TestMcpSetIapPricingTiers:
                 project_path="proj",
                 app="myapp",
                 store="play",
-                product_prices={"prod": 1.99},
+                products={"prod": {"base_usd": 1.99}},
                 live_rates=False,
             )
         ))
@@ -552,7 +655,7 @@ class TestMcpSetIapPricingTiers:
                 project_path="proj",
                 app="myapp",
                 store="play",
-                product_prices={"prod": 1.99},
+                products={"prod": {"base_usd": 1.99}},
                 countries=["US", "GB", "CA"],
                 live_rates=False,
             )
@@ -565,13 +668,13 @@ class TestMcpSetIapPricingTiers:
         result_no_t5 = _json(mcp_server.perfectdeck_set_iap_pricing_tiers(
             mcp_server.SetIapPricingTiersInput(
                 project_path="proj", app="myapp", store="play",
-                product_prices={"prod": 1.99}, live_rates=False,
+                products={"prod": {"base_usd": 1.99}}, live_rates=False,
             )
         ))
         result_with_t5 = _json(mcp_server.perfectdeck_set_iap_pricing_tiers(
             mcp_server.SetIapPricingTiersInput(
                 project_path="proj", app="myapp", store="play",
-                product_prices={"prod": 1.99}, include_tier5=True, live_rates=False,
+                products={"prod": {"base_usd": 1.99}}, include_tier5=True, live_rates=False,
             )
         ))
         assert result_with_t5["countries_configured"] > result_no_t5["countries_configured"]
@@ -589,7 +692,7 @@ class TestMcpSetIapPricingTiers:
                 project_path="proj",
                 app="myapp",
                 store="play",
-                product_prices={"com.app.credits": 1.99},
+                products={"com.app.credits": {"base_usd": 1.99}},
                 countries=["US", "GB"],
                 live_rates=False,
             )
@@ -606,7 +709,7 @@ class TestMcpSetIapPricingTiers:
         mcp_server.perfectdeck_set_iap_pricing_tiers(
             mcp_server.SetIapPricingTiersInput(
                 project_path="proj", app="myapp", store="play",
-                product_prices={"prod": 1.99},
+                products={"prod": {"base_usd": 1.99}},
                 countries=["JP"],
                 live_rates=False,
             )
@@ -617,7 +720,7 @@ class TestMcpSetIapPricingTiers:
         mcp_server.perfectdeck_set_iap_pricing_tiers(
             mcp_server.SetIapPricingTiersInput(
                 project_path="proj", app="myapp", store="play",
-                product_prices={"prod": 1.99},
+                products={"prod": {"base_usd": 1.99}},
                 countries=["JP"],
                 live_rates=False,
                 exchange_rate_overrides={"JPY": EXCHANGE_RATES_TO_USD["JPY"] * 2},
@@ -639,7 +742,7 @@ class TestMcpSetIapPricingTiers:
         mcp_server.perfectdeck_set_iap_pricing_tiers(
             mcp_server.SetIapPricingTiersInput(
                 project_path="proj", app="myapp", store="play",
-                product_prices={"prod": 1.99},
+                products={"prod": {"base_usd": 1.99}},
                 countries=["US"],
                 live_rates=False,
             )
@@ -653,10 +756,35 @@ class TestMcpSetIapPricingTiers:
         result = _json(mcp_server.perfectdeck_set_iap_pricing_tiers(
             mcp_server.SetIapPricingTiersInput(
                 project_path="proj", app="myapp", store="play",
-                product_prices={"p": 1.99}, live_rates=False,
+                products={"p": {"base_usd": 1.99}}, live_rates=False,
             )
         ))
         assert "hint" in result
+
+    def test_bundle_group_preserves_non_increasing_price_per_unit(self, tmp_path):
+        _setup_project(tmp_path)
+        mcp_server.perfectdeck_set_iap_pricing_tiers(
+            mcp_server.SetIapPricingTiersInput(
+                project_path="proj",
+                app="myapp",
+                store="play",
+                products={
+                    "credits_10": {"base_usd": 1.99, "units": 10, "value_group": "credits"},
+                    "credits_25": {"base_usd": 3.99, "units": 25, "value_group": "credits"},
+                    "credits_50": {"base_usd": 6.99, "units": 50, "value_group": "credits"},
+                },
+                countries=["US", "CA", "GB", "ES", "RU"],
+                live_rates=False,
+            )
+        )
+        products = self._get_products(tmp_path)
+        for country in ["US", "CA", "GB", "ES", "RU"]:
+            ratios = [
+                products["credits_10"]["pricing"][country]["price"] / 10,
+                products["credits_25"]["pricing"][country]["price"] / 25,
+                products["credits_50"]["pricing"][country]["price"] / 50,
+            ]
+            assert ratios[0] >= ratios[1] >= ratios[2], f"{country} ratios out of order: {ratios}"
 
 
 # ===========================================================================
@@ -714,6 +842,53 @@ class TestMcpConfigureIapPricingTiers:
         )
         us_price = self._get_products(tmp_path)["prod"]["pricing"]["US"]["price"]
         assert us_price in PRICE_POINTS["USD"]
+
+    def test_bundle_ladder_shorthand_preserves_non_increasing_price_per_unit(self, tmp_path):
+        _setup_project(tmp_path)
+        mcp_server.perfectdeck_configure_iap(
+            mcp_server.ConfigureIapInput(
+                project_path="proj",
+                app="myapp",
+                store="play",
+                products={
+                    "credits_10": {
+                        "pricing_tiers": {
+                            "base_usd": 1.99,
+                            "units": 10,
+                            "value_group": "credits",
+                            "live_rates": False,
+                            "countries": ["US", "CA", "GB", "ES", "RU"],
+                        }
+                    },
+                    "credits_25": {
+                        "pricing_tiers": {
+                            "base_usd": 3.99,
+                            "units": 25,
+                            "value_group": "credits",
+                            "live_rates": False,
+                            "countries": ["US", "CA", "GB", "ES", "RU"],
+                        }
+                    },
+                    "credits_50": {
+                        "pricing_tiers": {
+                            "base_usd": 6.99,
+                            "units": 50,
+                            "value_group": "credits",
+                            "live_rates": False,
+                            "countries": ["US", "CA", "GB", "ES", "RU"],
+                        }
+                    },
+                },
+            )
+        )
+        products = self._get_products(tmp_path)
+        for country in ["US", "CA", "GB", "ES", "RU"]:
+            ratios = [
+                products["credits_10"]["pricing"][country]["price"] / 10,
+                products["credits_25"]["pricing"][country]["price"] / 25,
+                products["credits_50"]["pricing"][country]["price"] / 50,
+            ]
+            assert ratios[0] >= ratios[1] >= ratios[2], f"{country} ratios out of order: {ratios}"
 
     def test_manual_pricing_preserved_as_is(self, tmp_path):
         _setup_project(tmp_path)

@@ -811,6 +811,8 @@ class ConfigureIapInput(BaseModel):
             "\"pricing\": {\"GB\": {\"currency\": \"GBP\", \"price\": 1.79}, \"CA\": {\"currency\": \"CAD\", \"price\": 2.49}}}. "
             "Shorthand: use \"pricing_tiers\": {\"base_usd\": 1.99} instead of a manual \"pricing\" dict to auto-generate "
             "regional prices for 100+ countries via PPP tiers. "
+            "For bundle ladders, add \"units\" and optional \"value_group\" inside \"pricing_tiers\" so larger packs "
+            "keep a non-increasing price per unit across markets. "
             "Supports optional keys: \"live_rates\" (bool, default true), \"exchange_rate_overrides\" ({currency: rate}), "
             "\"include_tier5\" (bool), \"currency_overrides\" ({country: currency}), \"tier_overrides\" ({tier: config}). "
             "Locales not provided are auto-filled from the baseline locale. "
@@ -832,11 +834,13 @@ class SetIapPricingTiersInput(BaseModel):
     project_path: str = Field(default=".", min_length=1)
     app: str = Field(..., min_length=1, description="App identifier as defined in listings.yaml.")
     store: StoreName = Field(..., description="Target store: 'play' or 'app_store'.")
-    product_prices: dict[str, float] = Field(
+    products: dict[str, dict[str, Any]] = Field(
         ...,
         description=(
-            "Map of product_id → base price in USD. "
-            "e.g. {'com.app.credits_10': 1.99, 'com.app.credits_25': 3.99}"
+            "Map of product_id → pricing spec. "
+            "Each spec requires {base_usd}. "
+            "Optional {units, value_group} lets the solver preserve bundle value ladders, "
+            "e.g. {'com.app.credits_10': {'base_usd': 1.99, 'units': 10, 'value_group': 'credits'}}."
         ),
     )
     tier_overrides: dict[str, Any] | None = Field(
@@ -2555,6 +2559,7 @@ def _local_products_to_app_store_list(products: dict[str, Any]) -> list[dict[str
 def _expand_pricing_tiers(products: dict[str, Any], store: str) -> dict[str, Any]:
     """Replace pricing_tiers shorthand with a fully calculated pricing dict."""
     expanded: dict[str, Any] = {}
+    pricing_runs: dict[str, dict[str, Any]] = {}
     for pid, cfg in products.items():
         if not isinstance(cfg, dict) or "pricing_tiers" not in cfg:
             expanded[pid] = cfg
@@ -2570,17 +2575,34 @@ def _expand_pricing_tiers(products: dict[str, Any], store: str) -> dict[str, Any
         live_rates: bool = bool(tier_cfg.get("live_rates", True))
         exchange_rate_overrides: dict | None = tier_cfg.get("exchange_rate_overrides")
         countries: list | None = tier_cfg.get("countries")
-        cfg["pricing"] = regional_pricing.calculate_regional_prices(
-            base_usd=base_usd,
-            store=store,
-            tiers=tier_overrides,
-            include_tier5=include_tier5,
-            currency_overrides=currency_overrides,
-            live_rates=live_rates,
-            exchange_rate_overrides=exchange_rate_overrides,
-            countries=countries,
-        )
         expanded[pid] = cfg
+        pricing_options = {
+            "tiers": tier_overrides,
+            "include_tier5": include_tier5,
+            "currency_overrides": currency_overrides,
+            "live_rates": live_rates,
+            "exchange_rate_overrides": exchange_rate_overrides,
+            "countries": countries,
+        }
+        run_key = json.dumps(pricing_options, sort_keys=True, ensure_ascii=False)
+        run = pricing_runs.setdefault(
+            run_key,
+            {"options": pricing_options, "products": {}},
+        )
+        run["products"][pid] = {
+            "base_usd": base_usd,
+            "units": tier_cfg.get("units"),
+            "value_group": tier_cfg.get("value_group"),
+        }
+
+    for run in pricing_runs.values():
+        calculated = regional_pricing.calculate_regional_prices_for_products(
+            products=run["products"],
+            store=store,
+            **run["options"],
+        )
+        for pid, pricing in calculated.items():
+            expanded[pid]["pricing"] = pricing
     return expanded
 
 
@@ -2619,8 +2641,12 @@ def perfectdeck_configure_iap(params: ConfigureIapInput) -> str:
 def perfectdeck_set_iap_pricing_tiers(params: SetIapPricingTiersInput) -> str:
     """Auto-configure regional pricing for IAP products using PPP tiers.
 
-    Provide only the base USD price per product; the tool calculates prices for
-    100+ countries across 5 income tiers with currency-aware price point snapping.
+    Provide a base USD price per product; the tool calculates prices for 100+
+    countries across 5 income tiers with currency-aware price point snapping.
+
+    Products may optionally declare ``units`` and ``value_group`` so bundle
+    ladders are solved together and larger packs never end up with a worse
+    price per unit than smaller packs.
 
     Tiers (multipliers):
       tier1 (1.0×): US, CA, AU, GB, DE, FR, NL, Nordic, Gulf...
@@ -2637,20 +2663,20 @@ def perfectdeck_set_iap_pricing_tiers(params: SetIapPricingTiersInput) -> str:
     Merges into existing product config, preserving localizations.
     """
     svc = _router().service_for(params.project_path)
-    # Fetch live rates once, shared across all products in this call
-    pricing_data: dict[str, Any] = {}
-    for product_id, base_usd in params.product_prices.items():
-        regional = regional_pricing.calculate_regional_prices(
-            base_usd=base_usd,
-            store=params.store,
-            tiers=params.tier_overrides,
-            include_tier5=params.include_tier5,
-            currency_overrides=params.currency_overrides,
-            live_rates=params.live_rates,
-            exchange_rate_overrides=params.exchange_rate_overrides,
-            countries=params.countries,
-        )
-        pricing_data[product_id] = {"pricing": regional}
+    calculated = regional_pricing.calculate_regional_prices_for_products(
+        products=params.products,
+        store=params.store,
+        tiers=params.tier_overrides,
+        include_tier5=params.include_tier5,
+        currency_overrides=params.currency_overrides,
+        live_rates=params.live_rates,
+        exchange_rate_overrides=params.exchange_rate_overrides,
+        countries=params.countries,
+    )
+    pricing_data: dict[str, Any] = {
+        product_id: {"pricing": pricing}
+        for product_id, pricing in calculated.items()
+    }
 
     # Split pricing between products and subscriptions based on existing listing
     section = svc.list_section(params.app, params.store)
@@ -2671,7 +2697,7 @@ def perfectdeck_set_iap_pricing_tiers(params: SetIapPricingTiersInput) -> str:
     return _result(
         {
             "ok": True,
-            "products_configured": len(params.product_prices),
+            "products_configured": len(params.products),
             "countries_configured": country_count,
             "store": params.store,
         },

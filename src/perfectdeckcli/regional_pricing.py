@@ -136,7 +136,7 @@ COUNTRY_CURRENCY: dict[str, str] = {
 EXCHANGE_RATES_TO_USD: dict[str, float] = {
     "USD": 1.0, "EUR": 0.92, "GBP": 0.79, "CAD": 1.36, "AUD": 1.54,
     "INR": 83.0, "BRL": 5.0, "JPY": 148.0, "KRW": 1340.0, "MXN": 17.5,
-    "SGD": 1.35, "NZD": 1.63, "HKD": 7.8, "TWD": 31.5, "THB": 35.0,
+    "SGD": 1.35, "NZD": 1.63, "HKD": 7.8, "MOP": 8.07, "TWD": 31.5, "THB": 35.0,
     "PLN": 4.0, "CZK": 22.5, "SEK": 10.5, "NOK": 10.7, "DKK": 6.9,
     "CHF": 0.9, "ZAR": 18.5, "TRY": 32.0, "RUB": 90.0, "SAR": 3.75,
     "AED": 3.67, "MYR": 4.7, "IDR": 15800.0, "PHP": 56.0, "VND": 24500.0,
@@ -164,26 +164,19 @@ ZERO_DECIMAL_CURRENCIES: set[str] = {
     "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF",
 }
 
+_NOMINAL_PRICE_PRESERVE_MIN_RATIO = 0.85
+_NOMINAL_PRICE_PRESERVE_MAX_RATIO = 1.45
 
-def _round_to_99_threshold(price: float) -> float:
-    """Round to ``.99`` using a ``.50`` fractional threshold.
 
-    Rules:
-    - fractional part ``< .50``: previous ``.99`` (e.g. ``2.30 -> 1.99``)
-    - fractional part ``>= .50``: next ``.99`` (e.g. ``2.54 -> 2.99``)
-    """
+def _round_up_to_99(price: float) -> float:
+    """Round upward to a ``.99`` ending for currencies with fractional pricing."""
     if price <= 0:
         return 0.99
-
-    whole = int(math.floor(price))
-    fractional = price - whole
-
-    if fractional < 0.50:
-        candidate = (whole - 1) + 0.99
-    else:
-        candidate = whole + 0.99
-
-    return round(max(0.99, candidate), 2)
+    whole = int(price)
+    candidate = whole + 0.99
+    if candidate < price:
+        candidate = whole + 1.99
+    return round(candidate, 2)
 
 
 def fetch_live_rates(timeout: float = _FETCH_TIMEOUT) -> dict[str, float]:
@@ -305,34 +298,219 @@ APP_STORE_TERRITORY: dict[str, str] = {
 
 
 def snap_to_price_point(price: float, currency: str) -> float:
-    """Snap to an allowed store price point.
+    """Snap to an allowed store price point, rounding upward.
 
-    For currencies with explicit store grids, this prefers ``.99`` endings
-    using the ``.50`` threshold rule:
-    - fractional ``< .50``: previous ``.99``
-    - fractional ``>= .50``: next ``.99``
+    For currencies with explicit store grids, this uses the lowest valid point
+    that is not below the target price, and prefers ``.99`` endings when
+    available at or above that target.
     """
     points = PRICE_POINTS.get(currency)
     if points:
         ordered = sorted(points)
         if price <= ordered[0]:
             return ordered[0]
-        ninety_nine = sorted(
-            p for p in ordered if int(round((p - int(p)) * 100)) == 99
-        )
-        if ninety_nine:
-            target = _round_to_99_threshold(price)
-            return min(ninety_nine, key=lambda p: abs(p - target))
-
         upward = [p for p in ordered if p >= price]
         if not upward:
             return ordered[-1]
+        ninety_nine = [
+            p for p in upward if int(round((p - int(p)) * 100)) == 99
+        ]
+        if ninety_nine:
+            return ninety_nine[0]
         return upward[0]
     # For currencies without a defined price grid, avoid falling back to USD points
     # (which gives wrong magnitudes). Keep no-cent currencies whole-number only.
     if currency in ZERO_DECIMAL_CURRENCIES:
         return float(max(0, math.ceil(price)))
-    return _round_to_99_threshold(price)
+    return _round_up_to_99(price)
+
+
+def _iter_pricing_scope(
+    store: str,
+    tiers: dict[str, dict],
+    include_tier5: bool,
+    countries: list[str] | None,
+) -> list[tuple[str, str, float]]:
+    """Return ``[(country_code, store_code, multiplier), ...]`` for a pricing run."""
+    tier_keys = list(tiers.keys())
+    if not include_tier5 and "tier5" in tier_keys:
+        tier_keys = [t for t in tier_keys if t != "tier5"]
+
+    country_filter: set[str] | None = set(countries) if countries else None
+    scope: list[tuple[str, str, float]] = []
+    for tier_name in tier_keys:
+        tier = tiers[tier_name]
+        multiplier = float(tier["multiplier"])
+        for country in tier["countries"]:
+            if country_filter is not None and country not in country_filter:
+                continue
+            if store == "app_store":
+                code = APP_STORE_TERRITORY.get(country)
+                if not code:
+                    continue
+            else:
+                code = country
+            scope.append((country, code, multiplier))
+    return scope
+
+
+def _normalize_product_specs(
+    products: dict[str, dict],
+) -> tuple[dict[str, dict[str, float | int | str | None]], dict[str, list[str]], list[str]]:
+    """Normalize product pricing metadata and derive value groups."""
+    normalized: dict[str, dict[str, float | int | str | None]] = {}
+    groups: dict[str, list[str]] = {}
+    independent: list[str] = []
+
+    for product_id, raw in products.items():
+        if not isinstance(raw, dict):
+            raise ValueError(f"Product '{product_id}' must be a dict.")
+        if "base_usd" not in raw:
+            raise ValueError(f"Product '{product_id}' is missing required field 'base_usd'.")
+
+        base_usd = float(raw["base_usd"])
+        units_raw = raw.get("units")
+        units: int | None = None
+        group: str | None = None
+        if units_raw is not None:
+            units = int(units_raw)
+            if units <= 0:
+                raise ValueError(f"Product '{product_id}' has invalid 'units': {units_raw!r}")
+            group_raw = raw.get("value_group")
+            group = str(group_raw).strip() if group_raw is not None else "default"
+            if not group:
+                group = "default"
+            groups.setdefault(group, []).append(product_id)
+        else:
+            independent.append(product_id)
+
+        normalized[product_id] = {
+            "base_usd": base_usd,
+            "units": units,
+            "value_group": group,
+        }
+
+    return normalized, groups, independent
+
+
+def _solve_value_group_prices(
+    product_ids: list[str],
+    specs: dict[str, dict[str, float | int | str | None]],
+    currency: str,
+    targets: dict[str, float],
+) -> dict[str, float]:
+    """Price a bundle ladder so larger packs never have a worse unit price."""
+    ordered = sorted(
+        product_ids,
+        key=lambda product_id: (
+            int(specs[product_id]["units"]),  # type: ignore[arg-type]
+            float(specs[product_id]["base_usd"]),
+            product_id,
+        ),
+        reverse=True,
+    )
+
+    prices: dict[str, float] = {}
+    next_unit_price: float | None = None
+    for product_id in ordered:
+        units = int(specs[product_id]["units"])  # type: ignore[arg-type]
+        min_price = targets[product_id]
+        if next_unit_price is not None:
+            min_price = max(min_price, next_unit_price * units)
+        snapped = snap_to_price_point(min_price, currency)
+        prices[product_id] = snapped
+        next_unit_price = snapped / units
+    return prices
+
+
+def _preserved_nominal_price(
+    *,
+    base_usd: float,
+    currency: str,
+    effective_ratio: float,
+) -> float | None:
+    """Keep the base sticker price for near-parity currencies when possible.
+
+    This avoids cases like ``0.99 USD -> 1.99 CAD`` where FX conversion is
+    close enough to parity that jumping to the next local price point feels
+    materially more expensive than the USD anchor.
+    """
+    if not (_NOMINAL_PRICE_PRESERVE_MIN_RATIO <= effective_ratio <= _NOMINAL_PRICE_PRESERVE_MAX_RATIO):
+        return None
+
+    base_nominal = round(float(base_usd), 2)
+    points = PRICE_POINTS.get(currency)
+    if not points:
+        return None
+
+    for point in points:
+        if math.isclose(point, base_nominal, abs_tol=0.001):
+            return point
+    return None
+
+
+def calculate_regional_prices_for_products(
+    products: dict[str, dict],
+    store: str,
+    tiers: dict | None = None,
+    include_tier5: bool = False,
+    currency_overrides: dict | None = None,
+    live_rates: bool = True,
+    exchange_rate_overrides: dict[str, float] | None = None,
+    countries: list[str] | None = None,
+) -> dict[str, dict[str, dict]]:
+    """Calculate regional prices for one or more products.
+
+    Products may optionally include:
+    - ``units``: quantity of credits/coins/etc. contained in the product
+    - ``value_group``: products in the same group are solved together so larger
+      bundles never end up with a worse price per unit than smaller bundles
+    """
+    effective_tiers = {k: dict(v) for k, v in PRICING_TIERS.items()}
+    if tiers:
+        for k, v in tiers.items():
+            if k in effective_tiers:
+                effective_tiers[k] = {**effective_tiers[k], **v}
+            else:
+                effective_tiers[k] = dict(v)
+
+    rates = _effective_rates(live_rates, exchange_rate_overrides)
+    scope = _iter_pricing_scope(store, effective_tiers, include_tier5, countries)
+    specs, groups, independent = _normalize_product_specs(products)
+
+    result: dict[str, dict[str, dict]] = {product_id: {} for product_id in products}
+    for country, store_code, multiplier in scope:
+        currency = (currency_overrides or {}).get(country) or COUNTRY_CURRENCY.get(country, "USD")
+        rate = rates.get(currency, 1.0)
+        effective_ratio = multiplier * rate
+        targets = {
+            product_id: float(spec["base_usd"]) * effective_ratio
+            for product_id, spec in specs.items()
+        }
+        for product_id, spec in specs.items():
+            preserved = _preserved_nominal_price(
+                base_usd=float(spec["base_usd"]),
+                currency=currency,
+                effective_ratio=effective_ratio,
+            )
+            if preserved is not None:
+                targets[product_id] = min(targets[product_id], preserved)
+
+        for product_id in independent:
+            snapped = snap_to_price_point(targets[product_id], currency)
+            result[product_id][store_code] = {"currency": currency, "price": snapped}
+
+        for group_product_ids in groups.values():
+            if len(group_product_ids) == 1:
+                product_id = group_product_ids[0]
+                snapped = snap_to_price_point(targets[product_id], currency)
+                result[product_id][store_code] = {"currency": currency, "price": snapped}
+                continue
+            solved = _solve_value_group_prices(group_product_ids, specs, currency, targets)
+            for product_id, price in solved.items():
+                result[product_id][store_code] = {"currency": currency, "price": price}
+
+    return result
 
 
 def calculate_regional_prices(
@@ -363,38 +541,14 @@ def calculate_regional_prices(
     Returns:
         ``{country_or_territory_code: {"currency": str, "price": float}}``
     """
-    effective_tiers = {k: dict(v) for k, v in PRICING_TIERS.items()}
-    if tiers:
-        for k, v in tiers.items():
-            if k in effective_tiers:
-                effective_tiers[k] = {**effective_tiers[k], **v}
-            else:
-                effective_tiers[k] = dict(v)
-
-    tier_keys = list(effective_tiers.keys())
-    if not include_tier5 and "tier5" in tier_keys:
-        tier_keys = [t for t in tier_keys if t != "tier5"]
-
-    rates = _effective_rates(live_rates, exchange_rate_overrides)
-    country_filter: set[str] | None = set(countries) if countries else None
-
-    result: dict[str, dict] = {}
-    for tier_name in tier_keys:
-        tier = effective_tiers[tier_name]
-        multiplier: float = float(tier["multiplier"])
-        for country in tier["countries"]:
-            if country_filter is not None and country not in country_filter:
-                continue
-            currency = (currency_overrides or {}).get(country) or COUNTRY_CURRENCY.get(country, "USD")
-            rate = rates.get(currency, 1.0)
-            local_price = base_usd * multiplier * rate
-            snapped = snap_to_price_point(local_price, currency)
-
-            if store == "app_store":
-                code = APP_STORE_TERRITORY.get(country)
-                if code:
-                    result[code] = {"currency": currency, "price": snapped}
-            else:
-                result[country] = {"currency": currency, "price": snapped}
-
-    return result
+    product_prices = calculate_regional_prices_for_products(
+        products={"__single__": {"base_usd": base_usd}},
+        store=store,
+        tiers=tiers,
+        include_tier5=include_tier5,
+        currency_overrides=currency_overrides,
+        live_rates=live_rates,
+        exchange_rate_overrides=exchange_rate_overrides,
+        countries=countries,
+    )
+    return product_prices["__single__"]

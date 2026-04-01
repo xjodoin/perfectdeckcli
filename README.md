@@ -8,6 +8,7 @@ It supports:
 - Add/update/delete any listing element through dotted key paths
 
 Client setup guide: `docs/mcp-client-setup.md`
+Pricing policy: `docs/pricing-policy.md`
 
 ## Data model
 

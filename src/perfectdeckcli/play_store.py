@@ -855,47 +855,42 @@ def _merge_regional_configs(
     return list(merged.values())
 
 
-def _upsert_legacy_and_default_purchase_options(
+def _upsert_purchase_options_with_pricing(
     purchase_options: Sequence[Dict[str, Any]],
     new_by_region: Mapping[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Ensure both ``legacy-base`` and ``default`` purchase options contain merged regional pricing."""
-    target_ids = ("legacy-base", "default")
+    """Update the ``default`` purchase option with merged regional pricing.
+
+    Applies pricing only to the ``default`` purchase option.  If no ``default``
+    exists, one is created with ``legacyCompatible: true``.  All other purchase
+    options (including ``legacy-base``) are preserved unchanged.
+    """
     updated_pos: List[Dict[str, Any]] = []
-    seen_ids: set[str] = set()
+    default_found = False
 
     for po in purchase_options:
         po_id = po.get("purchaseOptionId")
-        if po_id in target_ids:
-            seen_ids.add(po_id)
+        if po_id == "default":
+            default_found = True
             po_copy = dict(po)
             po_copy["regionalPricingAndAvailabilityConfigs"] = _merge_regional_configs(
                 po.get("regionalPricingAndAvailabilityConfigs", []),
                 new_by_region,
             )
-            if po_id == "legacy-base":
-                buy_option = po_copy.get("buyOption")
-                if not isinstance(buy_option, dict):
-                    buy_option = {}
-                buy_option = dict(buy_option)
-                buy_option.setdefault("legacyCompatible", True)
-                po_copy["buyOption"] = buy_option
+            # Ensure default is legacy compatible
+            buy_option = dict(po_copy.get("buyOption") or {})
+            buy_option["legacyCompatible"] = True
+            po_copy["buyOption"] = buy_option
             updated_pos.append(po_copy)
         else:
             updated_pos.append(po)
 
-    for po_id in target_ids:
-        if po_id in seen_ids:
-            continue
-        po_entry: Dict[str, Any] = {
-            "purchaseOptionId": po_id,
+    if not default_found:
+        updated_pos.append({
+            "purchaseOptionId": "default",
+            "buyOption": {"legacyCompatible": True},
             "regionalPricingAndAvailabilityConfigs": list(new_by_region.values()),
-        }
-        if po_id == "legacy-base":
-            po_entry["buyOption"] = {"legacyCompatible": True}
-        else:
-            po_entry["buyOption"] = {}
-        updated_pos.append(po_entry)
+        })
 
     return updated_pos
 
@@ -994,7 +989,7 @@ def ensure_managed_products(
                 product_exists = False
                 pass  # Product doesn't exist yet
 
-            body["purchaseOptions"] = _upsert_legacy_and_default_purchase_options(
+            body["purchaseOptions"] = _upsert_purchase_options_with_pricing(
                 existing_pos,
                 new_by_region,
             )
@@ -1068,7 +1063,7 @@ def apply_regional_pricing(
         monetization.onetimeproducts().get(packageName=package_name, productId=sku)
     )
 
-    # Update regional pricing on both "legacy-base" and "default" purchase options.
+    # Update regional pricing on the "default" purchase option.
     po_list: List[Dict[str, Any]] = current.get("purchaseOptions") or []
     new_by_region: Dict[str, Dict[str, Any]] = {}
     for country, price_info in regional_prices.items():
@@ -1081,7 +1076,7 @@ def apply_regional_pricing(
             "availability": "AVAILABLE",
         }
 
-    current["purchaseOptions"] = _upsert_legacy_and_default_purchase_options(
+    current["purchaseOptions"] = _upsert_purchase_options_with_pricing(
         po_list,
         new_by_region,
     )
