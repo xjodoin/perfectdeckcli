@@ -37,7 +37,11 @@ dependencies = [
 dev = [
   "build>=1.2.2",
   "pytest>=9.0.0",
+  "ruff>=0.11.0",
 ]
+
+[tool.ruff]
+target-version = "py311"
 
 [project.scripts]
 perfectdeckcli = "perfectdeckcli.cli:main"

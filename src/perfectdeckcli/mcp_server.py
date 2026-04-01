@@ -9,13 +9,13 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
-logger = logging.getLogger(__name__)
-
 from .project_router import ProjectListingRouter
 from .service import diff_objects
 from . import play_store as play_store_api
 from . import app_store as app_store_api
 from . import regional_pricing
+
+logger = logging.getLogger(__name__)
 
 
 StoreName = Literal["play", "app_store"]

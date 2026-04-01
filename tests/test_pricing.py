@@ -13,7 +13,6 @@ from perfectdeckcli import mcp_server
 from perfectdeckcli import regional_pricing
 from perfectdeckcli.project_router import ProjectListingRouter
 from perfectdeckcli.regional_pricing import (
-    COUNTRY_CURRENCY,
     EXCHANGE_RATES_TO_USD,
     PRICE_POINTS,
     PRICING_TIERS,

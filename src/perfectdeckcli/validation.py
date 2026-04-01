@@ -146,7 +146,6 @@ def validate_products(
             continue
 
         # --- Default price ---
-        default_price_key = "default_price" if store == "play" else "pricing"
         if store == "play" and not product_config.get("default_price"):
             errors.append({"product_id": product_id, "issue": "missing_default_price"})
         elif store == "app_store":

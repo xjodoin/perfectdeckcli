@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-import yaml
 
 from perfectdeckcli.repository import SnapshotRepository
 from perfectdeckcli.service import ListingService
@@ -356,7 +355,7 @@ class TestMcpSnapshotTools:
         )
 
         # Bump creates snapshot of pre-bump state
-        bumped = _json(
+        _json(
             mcp_server.perfectdeck_bump_version(
                 mcp_server.BumpVersionInput(project_path="proj", app="prod", store="play", reason="bump")
             )

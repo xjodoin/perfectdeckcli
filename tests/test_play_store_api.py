@@ -3,18 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
-import random
-import time
-from pathlib import Path
-from typing import Any, Dict
-from unittest.mock import MagicMock, Mock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from perfectdeckcli.play_store import (
-    PLAY_LOCALE_MAP,
     VALID_IMAGE_TYPES,
     VALID_RELEASE_STATUSES,
     _compute_sha1,
@@ -27,7 +21,6 @@ from perfectdeckcli.play_store import (
     fetch_listings,
     fetch_products,
     fetch_subscriptions,
-    map_locale,
     publish_bundle,
     push_listings,
     update_release_notes,
