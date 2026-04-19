@@ -6,8 +6,9 @@ import hashlib
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Sequence
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -741,6 +742,8 @@ def upload_screenshots_batch(
     entries: Sequence[Mapping[str, Any]],
     *,
     replace: bool = True,
+    max_workers: int = 4,
+    on_progress: Callable[[int, int, str], None] | None = None,
 ) -> Dict[str, Any]:
     """Upload screenshots for many (locale, image_type) slots in a single edit.
 
@@ -755,6 +758,11 @@ def upload_screenshots_batch(
     locale/image_type combinations are provided. This avoids the quota
     exhaustion that occurs when calling :func:`upload_screenshots` dozens of
     times (e.g. 30 locales × 2 tablet slots = 60 commits).
+
+    Files within each entry are uploaded in parallel with ``max_workers``
+    threads. An ``on_progress(done, total, message)`` callback — if provided —
+    is invoked after each file upload completes, which MCP tools can bridge
+    to progress notifications to keep long-running calls from timing out.
 
     Returns ``{"ok": True, "uploaded": int, "skipped": int, "results": [...]}``
     where ``results`` contains per-entry ``{locale, image_type, uploaded,
@@ -797,6 +805,30 @@ def upload_screenshots_batch(
     total_skipped = 0
     results: list[Dict[str, Any]] = []
 
+    # Total files across the whole batch (used for progress reporting).
+    total_files = sum(len(e["paths"]) for e in normalized)
+    files_done = 0
+
+    def _emit_progress(message: str) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(files_done, total_files, message)
+        except Exception:  # pragma: no cover — progress is best-effort
+            logger.debug("on_progress callback raised", exc_info=True)
+
+    def _upload_one(path: Path, locale: str, image_type: str) -> None:
+        media = MediaFileUpload(str(path), mimetype="image/png")
+        _execute_with_retry(
+            edits.images().upload(
+                packageName=package_name,
+                editId=edit_id,
+                language=locale,
+                imageType=image_type,
+                media_body=media,
+            )
+        )
+
     try:
         for entry in normalized:
             locale = entry["locale"]
@@ -834,6 +866,8 @@ def upload_screenshots_batch(
                         "skipped": skipped,
                     })
                     total_skipped += skipped
+                    files_done += skipped
+                    _emit_progress(f"{locale}/{image_type}: unchanged, skipped {skipped}")
                     continue
 
                 _execute_with_retry(
@@ -845,18 +879,23 @@ def upload_screenshots_batch(
                     )
                 )
 
-            for file_path in paths:
-                media = MediaFileUpload(str(file_path), mimetype="image/png")
-                _execute_with_retry(
-                    edits.images().upload(
-                        packageName=package_name,
-                        editId=edit_id,
-                        language=locale,
-                        imageType=image_type,
-                        media_body=media,
-                    )
-                )
-                uploaded += 1
+            if paths:
+                # Upload in parallel — the Google discovery client builds fresh
+                # HTTP requests per call, so concurrent uploads within one edit
+                # are safe and cut wall-clock time roughly linearly.
+                workers = max(1, min(max_workers, len(paths)))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [
+                        pool.submit(_upload_one, p, locale, image_type)
+                        for p in paths
+                    ]
+                    for fut in as_completed(futures):
+                        fut.result()  # re-raise upload errors inside the try
+                        uploaded += 1
+                        files_done += 1
+                        _emit_progress(
+                            f"{locale}/{image_type}: uploaded {uploaded}/{len(paths)}"
+                        )
 
             results.append({
                 "locale": locale,
@@ -867,6 +906,7 @@ def upload_screenshots_batch(
             total_uploaded += uploaded
             total_skipped += skipped
 
+        _emit_progress("committing edit")
         _execute_with_retry(edits.commit(packageName=package_name, editId=edit_id))
         return {
             "ok": True,

@@ -615,6 +615,113 @@ class TestUploadScreenshotsBatch:
         svc.edits.return_value.delete.return_value.execute.assert_called_once()
         svc.edits.return_value.commit.assert_not_called()
 
+    def test_on_progress_called_per_file(self, tmp_path):
+        svc = _mock_service()
+        files = []
+        for i in range(4):
+            p = tmp_path / f"p{i}.png"
+            p.write_bytes(f"d{i}".encode())
+            files.append(str(p))
+
+        progress_events = []
+
+        def on_progress(done, total, message):
+            progress_events.append((done, total, message))
+
+        upload_screenshots_batch(
+            svc, "com.example.app",
+            entries=[
+                {"locale": "en-US", "image_type": "phoneScreenshots",
+                 "file_paths": files[:2]},
+                {"locale": "fr-FR", "image_type": "phoneScreenshots",
+                 "file_paths": files[2:]},
+            ],
+            on_progress=on_progress,
+            max_workers=2,
+        )
+        # 4 file uploads + 1 final "committing edit" message.
+        assert len(progress_events) == 5
+        # Cumulative done should reach total (=4).
+        assert progress_events[-2][0] == 4
+        assert progress_events[-2][1] == 4
+        assert progress_events[-1][2] == "committing edit"
+
+    def test_on_progress_called_on_skip(self, tmp_path):
+        svc = _mock_service()
+        img = tmp_path / "a.png"
+        img.write_bytes(b"same")
+        sha = hashlib.sha1(b"same").hexdigest()
+        svc.edits.return_value.images.return_value.list.return_value.execute.return_value = {
+            "images": [{"sha1": sha}]
+        }
+        events = []
+        upload_screenshots_batch(
+            svc, "com.example.app",
+            entries=[
+                {"locale": "en-US", "image_type": "phoneScreenshots", "file_paths": [str(img)]},
+            ],
+            on_progress=lambda d, t, m: events.append((d, t, m)),
+        )
+        # One skip event + committing event
+        assert any("skipped" in (m or "") for _, _, m in events)
+
+    def test_progress_callback_failure_is_swallowed(self, tmp_path):
+        """A buggy on_progress must not abort the batch."""
+        svc = _mock_service()
+        img = tmp_path / "a.png"
+        img.write_bytes(b"d")
+
+        def bad_progress(done, total, message):
+            raise RuntimeError("progress blew up")
+
+        result = upload_screenshots_batch(
+            svc, "com.example.app",
+            entries=[
+                {"locale": "en-US", "image_type": "phoneScreenshots", "file_paths": [str(img)]},
+            ],
+            on_progress=bad_progress,
+        )
+        assert result["ok"] is True
+        assert result["uploaded"] == 1
+
+    def test_parallel_uploads_respect_max_workers(self, tmp_path):
+        """With max_workers=N the pool should not exceed N concurrent uploads."""
+        import threading
+        import time
+
+        svc = _mock_service()
+        files = []
+        for i in range(6):
+            p = tmp_path / f"p{i}.png"
+            p.write_bytes(f"d{i}".encode())
+            files.append(str(p))
+
+        concurrent = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def slow_execute(*a, **kw):
+            nonlocal concurrent, peak
+            with lock:
+                concurrent += 1
+                peak = max(peak, concurrent)
+            time.sleep(0.02)
+            with lock:
+                concurrent -= 1
+            return {}
+
+        svc.edits.return_value.images.return_value.upload.return_value.execute.side_effect = slow_execute
+
+        upload_screenshots_batch(
+            svc, "com.example.app",
+            entries=[
+                {"locale": "en-US", "image_type": "phoneScreenshots", "file_paths": files},
+            ],
+            max_workers=3,
+        )
+        assert peak <= 3
+        assert peak >= 2  # confirm actual parallelism happened
+
 
 # ======================================================================
 # publish_bundle

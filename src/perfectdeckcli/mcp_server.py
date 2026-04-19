@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
 from .project_router import ProjectListingRouter
@@ -2217,14 +2219,18 @@ def perfectdeck_push_play_screenshots(params: PushPlayScreenshotsInput) -> str:
         "openWorldHint": True,
     },
 )
-def perfectdeck_batch_push_play_screenshots(params: PushPlayScreenshotsBatchInput) -> str:
+async def perfectdeck_batch_push_play_screenshots(
+    params: PushPlayScreenshotsBatchInput,
+    ctx: Context | None = None,
+) -> str:
     """Upload screenshots for many (locale, image_type) slots in a single Play edit.
 
     All entries are applied inside ONE edit and committed once, which costs
     a single unit of the daily save quota regardless of how many slots are
-    touched. Prefer this over looping perfectdeck_push_play_screenshots when
-    pushing to many locales — it avoids quota exhaustion and concurrent-edit
-    conflicts.
+    touched. Files within each entry upload in parallel and progress is
+    streamed back to the client, so large batches don't hit MCP read
+    timeouts. Prefer this over looping perfectdeck_push_play_screenshots
+    when pushing to many locales.
     """
     if params.app:
         pkg, creds = _resolve_play_credentials(
@@ -2244,12 +2250,55 @@ def perfectdeck_batch_push_play_screenshots(params: PushPlayScreenshotsBatchInpu
         }
         for e in params.entries
     ]
-    out = play_store_api.upload_screenshots_batch(
-        service=api,
-        package_name=pkg,
-        entries=entries,
-        replace=params.replace,
-    )
+
+    # Bridge the sync on_progress callback (called from worker threads) to
+    # the async ctx.report_progress, so the MCP client sees periodic
+    # keepalives during long uploads.
+    loop = asyncio.get_running_loop()
+    progress_state = {"done": 0, "total": 0, "message": ""}
+    progress_lock = threading.Lock()
+
+    def _sync_progress(done: int, total: int, message: str) -> None:
+        with progress_lock:
+            progress_state["done"] = done
+            progress_state["total"] = total
+            progress_state["message"] = message
+
+    async def _pump_progress() -> None:
+        if ctx is None:
+            return
+        last_done = -1
+        while True:
+            await asyncio.sleep(1.0)
+            with progress_lock:
+                done = progress_state["done"]
+                total = progress_state["total"]
+                message = progress_state["message"]
+            if done != last_done and total:
+                await ctx.report_progress(
+                    progress=float(done),
+                    total=float(total),
+                    message=message or None,
+                )
+                last_done = done
+
+    pump_task = asyncio.create_task(_pump_progress())
+    try:
+        out = await asyncio.to_thread(
+            play_store_api.upload_screenshots_batch,
+            service=api,
+            package_name=pkg,
+            entries=entries,
+            replace=params.replace,
+            on_progress=_sync_progress,
+        )
+    finally:
+        pump_task.cancel()
+        try:
+            await pump_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     if params.app:
         _persist_play_credentials(params.project_path, params.app, pkg, creds)
     return _result(out, "perfectdeck_batch_push_play_screenshots")
