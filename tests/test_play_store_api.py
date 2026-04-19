@@ -25,6 +25,7 @@ from perfectdeckcli.play_store import (
     push_listings,
     update_release_notes,
     upload_screenshots,
+    upload_screenshots_batch,
 )
 
 try:
@@ -481,6 +482,138 @@ class TestUploadScreenshots:
         )
         assert result["ok"] is True
         assert result["uploaded"] == 3
+
+
+# ======================================================================
+# upload_screenshots_batch
+# ======================================================================
+
+
+class TestUploadScreenshotsBatch:
+    def test_empty_entries_returns_no_op(self):
+        svc = _mock_service()
+        result = upload_screenshots_batch(svc, "com.example.app", entries=[])
+        assert result == {"ok": True, "uploaded": 0, "skipped": 0, "results": []}
+        svc.edits.return_value.insert.assert_not_called()
+
+    def test_single_commit_for_many_entries(self, tmp_path):
+        svc = _mock_service()
+        img1 = tmp_path / "a.png"
+        img1.write_bytes(b"a")
+        img2 = tmp_path / "b.png"
+        img2.write_bytes(b"b")
+
+        result = upload_screenshots_batch(
+            svc, "com.example.app",
+            entries=[
+                {"locale": "en-US", "image_type": "phoneScreenshots", "file_paths": [str(img1)]},
+                {"locale": "fr-FR", "image_type": "phoneScreenshots", "file_paths": [str(img2)]},
+                {"locale": "en-US", "image_type": "tenInchScreenshots", "file_paths": [str(img1)]},
+            ],
+        )
+        assert result["ok"] is True
+        assert result["uploaded"] == 3
+        assert len(result["results"]) == 3
+        edits = svc.edits.return_value
+        edits.insert.assert_called_once()
+        edits.commit.assert_called_once()
+        assert edits.images.return_value.upload.return_value.execute.call_count == 3
+
+    def test_invalid_image_type_raises_before_edit_opened(self, tmp_path):
+        svc = _mock_service()
+        img = tmp_path / "a.png"
+        img.write_bytes(b"a")
+        with pytest.raises(ValueError, match="invalid image_type"):
+            upload_screenshots_batch(
+                svc, "com.example.app",
+                entries=[
+                    {"locale": "en-US", "image_type": "bogus", "file_paths": [str(img)]},
+                ],
+            )
+        svc.edits.return_value.insert.assert_not_called()
+
+    def test_missing_file_raises_before_edit_opened(self):
+        svc = _mock_service()
+        with pytest.raises(FileNotFoundError):
+            upload_screenshots_batch(
+                svc, "com.example.app",
+                entries=[
+                    {"locale": "en-US", "image_type": "phoneScreenshots", "file_paths": ["/no/file.png"]},
+                ],
+            )
+        svc.edits.return_value.insert.assert_not_called()
+
+    def test_missing_locale_raises(self, tmp_path):
+        svc = _mock_service()
+        img = tmp_path / "a.png"
+        img.write_bytes(b"a")
+        with pytest.raises(ValueError, match="'locale' is required"):
+            upload_screenshots_batch(
+                svc, "com.example.app",
+                entries=[
+                    {"locale": "", "image_type": "phoneScreenshots", "file_paths": [str(img)]},
+                ],
+            )
+
+    def test_per_entry_replace_override(self, tmp_path):
+        svc = _mock_service()
+        img = tmp_path / "a.png"
+        img.write_bytes(b"a")
+
+        upload_screenshots_batch(
+            svc, "com.example.app",
+            entries=[
+                # replace default = True, this one overrides to False
+                {"locale": "en-US", "image_type": "phoneScreenshots",
+                 "file_paths": [str(img)], "replace": False},
+                # uses default replace=True
+                {"locale": "fr-FR", "image_type": "phoneScreenshots",
+                 "file_paths": [str(img)]},
+            ],
+            replace=True,
+        )
+        # Only the fr-FR entry should trigger deleteall
+        edits = svc.edits.return_value
+        assert edits.images.return_value.deleteall.return_value.execute.call_count == 1
+
+    def test_skip_when_hashes_match(self, tmp_path):
+        svc = _mock_service()
+        img = tmp_path / "a.png"
+        img.write_bytes(b"exact")
+        sha = hashlib.sha1(b"exact").hexdigest()
+        svc.edits.return_value.images.return_value.list.return_value.execute.return_value = {
+            "images": [{"sha1": sha}]
+        }
+
+        result = upload_screenshots_batch(
+            svc, "com.example.app",
+            entries=[
+                {"locale": "en-US", "image_type": "phoneScreenshots", "file_paths": [str(img)]},
+            ],
+        )
+        assert result["skipped"] == 1
+        assert result["uploaded"] == 0
+        # No deleteall, no upload — but we still open+commit the edit (harmless)
+        edits = svc.edits.return_value
+        edits.images.return_value.deleteall.return_value.execute.assert_not_called()
+        edits.images.return_value.upload.return_value.execute.assert_not_called()
+        edits.commit.assert_called_once()
+
+    def test_rolls_back_edit_on_upload_failure(self, tmp_path):
+        svc = _mock_service()
+        img = tmp_path / "a.png"
+        img.write_bytes(b"a")
+        svc.edits.return_value.images.return_value.upload.return_value.execute.side_effect = RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            upload_screenshots_batch(
+                svc, "com.example.app",
+                entries=[
+                    {"locale": "en-US", "image_type": "phoneScreenshots", "file_paths": [str(img)]},
+                ],
+            )
+        svc.edits.return_value.delete.return_value.execute.assert_called_once()
+        svc.edits.return_value.commit.assert_not_called()
 
 
 # ======================================================================

@@ -735,6 +735,153 @@ def upload_screenshots(
         raise
 
 
+def upload_screenshots_batch(
+    service: Any,
+    package_name: str,
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    replace: bool = True,
+) -> Dict[str, Any]:
+    """Upload screenshots for many (locale, image_type) slots in a single edit.
+
+    Each *entry* must be a mapping with keys:
+      - ``locale`` (str)
+      - ``image_type`` (str, one of ``VALID_IMAGE_TYPES``)
+      - ``file_paths`` (sequence of str | Path)
+      - ``replace`` (optional bool, overrides the top-level default)
+
+    All slot changes are grouped into ONE Play edit and committed once, which
+    counts as a single "save" against the daily quota regardless of how many
+    locale/image_type combinations are provided. This avoids the quota
+    exhaustion that occurs when calling :func:`upload_screenshots` dozens of
+    times (e.g. 30 locales × 2 tablet slots = 60 commits).
+
+    Returns ``{"ok": True, "uploaded": int, "skipped": int, "results": [...]}``
+    where ``results`` contains per-entry ``{locale, image_type, uploaded,
+    skipped}`` detail.
+    """
+    if not entries:
+        return {"ok": True, "uploaded": 0, "skipped": 0, "results": []}
+
+    # Validate everything up front so we never open an edit we can't use.
+    normalized: list[Dict[str, Any]] = []
+    for idx, entry in enumerate(entries):
+        locale = entry.get("locale")
+        image_type = entry.get("image_type")
+        raw_files = entry.get("file_paths", [])
+        entry_replace = entry.get("replace", replace)
+        if not locale:
+            raise ValueError(f"entries[{idx}]: 'locale' is required")
+        if image_type not in VALID_IMAGE_TYPES:
+            raise ValueError(
+                f"entries[{idx}]: invalid image_type {image_type!r}. "
+                f"Must be one of {sorted(VALID_IMAGE_TYPES)}."
+            )
+        paths = [Path(p) for p in raw_files]
+        for p in paths:
+            if not p.exists():
+                raise FileNotFoundError(f"Screenshot file not found: {p}")
+        normalized.append({
+            "locale": locale,
+            "image_type": image_type,
+            "paths": paths,
+            "replace": bool(entry_replace),
+        })
+
+    edits = service.edits()
+    insert_response = _execute_with_retry(
+        edits.insert(packageName=package_name, body={})
+    )
+    edit_id = insert_response["id"]
+    total_uploaded = 0
+    total_skipped = 0
+    results: list[Dict[str, Any]] = []
+
+    try:
+        for entry in normalized:
+            locale = entry["locale"]
+            image_type = entry["image_type"]
+            paths = entry["paths"]
+            entry_replace = entry["replace"]
+            uploaded = 0
+            skipped = 0
+
+            if entry_replace:
+                existing_response = _execute_with_retry(
+                    edits.images().list(
+                        packageName=package_name,
+                        editId=edit_id,
+                        language=locale,
+                        imageType=image_type,
+                    )
+                )
+                existing_images = existing_response.get("images", []) or []
+                existing_hashes = {
+                    img.get("sha1") for img in existing_images if img.get("sha1")
+                }
+                new_hashes = {_compute_sha1(p) for p in paths}
+
+                if (
+                    paths
+                    and existing_hashes == new_hashes
+                    and len(existing_images) == len(paths)
+                ):
+                    skipped = len(paths)
+                    results.append({
+                        "locale": locale,
+                        "image_type": image_type,
+                        "uploaded": 0,
+                        "skipped": skipped,
+                    })
+                    total_skipped += skipped
+                    continue
+
+                _execute_with_retry(
+                    edits.images().deleteall(
+                        packageName=package_name,
+                        editId=edit_id,
+                        language=locale,
+                        imageType=image_type,
+                    )
+                )
+
+            for file_path in paths:
+                media = MediaFileUpload(str(file_path), mimetype="image/png")
+                _execute_with_retry(
+                    edits.images().upload(
+                        packageName=package_name,
+                        editId=edit_id,
+                        language=locale,
+                        imageType=image_type,
+                        media_body=media,
+                    )
+                )
+                uploaded += 1
+
+            results.append({
+                "locale": locale,
+                "image_type": image_type,
+                "uploaded": uploaded,
+                "skipped": skipped,
+            })
+            total_uploaded += uploaded
+            total_skipped += skipped
+
+        _execute_with_retry(edits.commit(packageName=package_name, editId=edit_id))
+        return {
+            "ok": True,
+            "uploaded": total_uploaded,
+            "skipped": total_skipped,
+            "results": results,
+        }
+    except Exception:
+        try:
+            edits.delete(packageName=package_name, editId=edit_id).execute()
+        except HttpError:
+            pass
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Bundle publishing
 # ---------------------------------------------------------------------------

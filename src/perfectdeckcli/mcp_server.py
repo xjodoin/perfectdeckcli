@@ -153,6 +153,9 @@ _TOOL_HINTS: dict[str, str] = {
     "perfectdeck_push_play_screenshots": (
         "Screenshots uploaded to Google Play."
     ),
+    "perfectdeck_batch_push_play_screenshots": (
+        "Batch screenshot upload committed to Google Play as a single edit."
+    ),
     "perfectdeck_publish_play_bundle": (
         "Bundle uploaded. Track release status in Google Play Console."
     ),
@@ -678,6 +681,38 @@ class PushPlayScreenshotsInput(BaseModel):
     image_type: str = Field(..., min_length=1, description="e.g. phoneScreenshots, sevenInchScreenshots")
     file_paths: list[str] = Field(..., description="Absolute paths to screenshot files")
     replace: bool = Field(default=True, description="Delete existing screenshots before uploading")
+
+
+class PushPlayScreenshotsBatchEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    locale: str = Field(..., min_length=1, description="Play Store locale code")
+    image_type: str = Field(..., min_length=1, description="e.g. phoneScreenshots, sevenInchScreenshots")
+    file_paths: list[str] = Field(..., description="Absolute paths to screenshot files")
+    replace: bool | None = Field(
+        default=None,
+        description="Override the batch-level replace default for this entry.",
+    )
+
+
+class PushPlayScreenshotsBatchInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
+    app: str | None = Field(default=None, description="App identifier for credential resolution.")
+    package_name: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+    credentials_path: str | None = Field(default=None)
+    entries: list[PushPlayScreenshotsBatchEntry] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Per-slot upload entries. All modifications are grouped into one "
+            "Play edit and committed once, so the whole batch costs a single "
+            "unit of the Play daily save quota."
+        ),
+    )
+    replace: bool = Field(
+        default=True,
+        description="Default replace behavior for entries that don't set it.",
+    )
 
 
 class PushAppStoreScreenshotsInput(BaseModel):
@@ -2170,6 +2205,54 @@ def perfectdeck_push_play_screenshots(params: PushPlayScreenshotsInput) -> str:
     if params.app:
         _persist_play_credentials(params.project_path, params.app, pkg, creds)
     return _result(out, "perfectdeck_push_play_screenshots")
+
+
+@mcp.tool(
+    name="perfectdeck_batch_push_play_screenshots",
+    annotations={
+        "title": "Batch Push Play Screenshots",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_batch_push_play_screenshots(params: PushPlayScreenshotsBatchInput) -> str:
+    """Upload screenshots for many (locale, image_type) slots in a single Play edit.
+
+    All entries are applied inside ONE edit and committed once, which costs
+    a single unit of the daily save quota regardless of how many slots are
+    touched. Prefer this over looping perfectdeck_push_play_screenshots when
+    pushing to many locales — it avoids quota exhaustion and concurrent-edit
+    conflicts.
+    """
+    if params.app:
+        pkg, creds = _resolve_play_credentials(
+            params.project_path, params.app, params.package_name, params.credentials_path
+        )
+    else:
+        if not params.package_name:
+            raise ValueError("package_name is required when app is not set for credential resolution.")
+        pkg, creds = params.package_name, params.credentials_path
+    api = play_store_api.create_service(credentials_path=creds)
+    entries = [
+        {
+            "locale": e.locale,
+            "image_type": e.image_type,
+            "file_paths": e.file_paths,
+            "replace": params.replace if e.replace is None else e.replace,
+        }
+        for e in params.entries
+    ]
+    out = play_store_api.upload_screenshots_batch(
+        service=api,
+        package_name=pkg,
+        entries=entries,
+        replace=params.replace,
+    )
+    if params.app:
+        _persist_play_credentials(params.project_path, params.app, pkg, creds)
+    return _result(out, "perfectdeck_batch_push_play_screenshots")
 
 
 @mcp.tool(
