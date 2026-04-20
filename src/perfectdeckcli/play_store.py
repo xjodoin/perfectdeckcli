@@ -742,7 +742,7 @@ def upload_screenshots_batch(
     entries: Sequence[Mapping[str, Any]],
     *,
     replace: bool = True,
-    max_workers: int = 4,
+    max_workers: int = 1,
     on_progress: Callable[[int, int, str], None] | None = None,
 ) -> Dict[str, Any]:
     """Upload screenshots for many (locale, image_type) slots in a single edit.
@@ -759,10 +759,16 @@ def upload_screenshots_batch(
     exhaustion that occurs when calling :func:`upload_screenshots` dozens of
     times (e.g. 30 locales × 2 tablet slots = 60 commits).
 
-    Files within each entry are uploaded in parallel with ``max_workers``
-    threads. An ``on_progress(done, total, message)`` callback — if provided —
-    is invoked after each file upload completes, which MCP tools can bridge
-    to progress notifications to keep long-running calls from timing out.
+    ``on_progress(done, total, message)`` — if provided — is invoked after
+    each file upload completes, which MCP tools can bridge to progress
+    notifications to keep long-running calls from timing out.
+
+    ``max_workers`` controls upload parallelism within each entry. It defaults
+    to 1 (serial) because the googleapiclient discovery ``Resource`` shares a
+    single ``httplib2.Http`` transport that is **not thread-safe** — parallel
+    ``.execute()`` calls corrupt SSL state and surface as
+    "EOF occurred in violation of protocol". Only raise this if each worker
+    is given its own ``Http`` (not implemented here).
 
     Returns ``{"ok": True, "uploaded": int, "skipped": int, "results": [...]}``
     where ``results`` contains per-entry ``{locale, image_type, uploaded,
