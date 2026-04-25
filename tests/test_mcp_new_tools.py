@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import gzip
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -47,6 +48,301 @@ def _set_app_store_data(app: str, locale: str, data: dict) -> None:
                 locale=locale, key=key, value=value,
             )
         )
+
+
+def _app_store_auth_kwargs() -> dict:
+    return {
+        "app_id": "1234567890",
+        "key_id": "KEY123",
+        "issuer_id": "ISSUER456",
+        "private_key_path": "/tmp/AuthKey_KEY123.p8",
+    }
+
+
+# ======================================================================
+# Store analytics/reporting MCP tools
+# ======================================================================
+
+
+class TestAnalyticsReportingTools:
+    def test_app_store_sales_report_tool(self, tmp_path):
+        _setup_project(tmp_path)
+        client = MagicMock()
+        client.download_sales_report.return_value = gzip.compress(b"Date\tUnits\n2026-04-20\t9\n")
+        with patch("perfectdeckcli.mcp_server.app_store_api.AppStoreConnectClient.from_key_file", return_value=client):
+            out = _json(
+                mcp_server.perfectdeck_get_app_store_sales_report(
+                    mcp_server.AppStoreSalesReportInput(
+                        project_path="proj",
+                        app="prod",
+                        vendor_number="123456",
+                        max_rows=10,
+                        **_app_store_auth_kwargs(),
+                    )
+                )
+            )
+        assert out["ok"] is True
+        assert out["rows"][0]["Units"] == "9"
+        assert out["report_type"] == "SALES"
+        client.download_sales_report.assert_called_once()
+
+    def test_app_store_analytics_list_instances_tool(self, tmp_path):
+        _setup_project(tmp_path)
+        client = MagicMock()
+        client.list_analytics_report_instances.return_value = {"data": [{"id": "i1"}]}
+        with patch("perfectdeckcli.mcp_server.app_store_api.AppStoreConnectClient.from_key_file", return_value=client):
+            out = _json(
+                mcp_server.perfectdeck_list_app_store_analytics_instances(
+                    mcp_server.ListAppStoreAnalyticsInstancesInput(
+                        project_path="proj",
+                        app="prod",
+                        report_id="r1",
+                        granularity="DAILY",
+                        processing_date="2026-04-20",
+                        **_app_store_auth_kwargs(),
+                    )
+                )
+            )
+        assert out["ok"] is True
+        assert out["response"]["data"][0]["id"] == "i1"
+        client.list_analytics_report_instances.assert_called_once_with(
+            "r1", granularity="DAILY", processing_date="2026-04-20", limit=200,
+        )
+
+    def test_play_vitals_tool(self, tmp_path):
+        _setup_project(tmp_path)
+        service = mcp_server._router().service_for("proj")
+        service.save_credentials("prod", "play", {"package_name": "com.example.app"})
+        with (
+            patch("perfectdeckcli.mcp_server.play_store_api.create_reporting_service", return_value=MagicMock()) as create_reporting,
+            patch("perfectdeckcli.mcp_server.play_store_api.query_vitals_metric", return_value={"rows": [{"metrics": []}]}) as query,
+        ):
+            out = _json(
+                mcp_server.perfectdeck_query_play_vitals(
+                    mcp_server.PlayVitalsQueryInput(
+                        project_path="proj",
+                        app="prod",
+                        metric_set="crash_rate",
+                        start_date="2026-04-20",
+                        end_date="2026-04-22",
+                        dimensions=["versionCode"],
+                    )
+                )
+            )
+        assert out["ok"] is True
+        assert out["package_name"] == "com.example.app"
+        create_reporting.assert_called_once()
+        assert query.call_args.args[1] == "com.example.app"
+        assert query.call_args.kwargs["dimensions"] == ["versionCode"]
+
+    def test_play_report_download_tool(self, tmp_path):
+        _setup_project(tmp_path)
+        session = MagicMock()
+        raw = "Date,Value\n2026-04-20,3\n".encode("utf-16")
+        with (
+            patch("perfectdeckcli.mcp_server.play_store_api.create_storage_session", return_value=session),
+            patch("perfectdeckcli.mcp_server.play_store_api.download_play_report_object", return_value=raw),
+        ):
+            out = _json(
+                mcp_server.perfectdeck_download_play_report_file(
+                    mcp_server.DownloadPlayReportFileInput(
+                        bucket="pubsite_prod_rev_123",
+                        object_name="stats/installs/report.csv",
+                        max_rows=10,
+                    )
+                )
+            )
+        assert out["ok"] is True
+        assert out["rows"][0]["Value"] == "3"
+        assert out["content_bytes"] == len(raw)
+
+    def test_app_store_custom_product_page_tools(self, tmp_path):
+        _setup_project(tmp_path)
+        client = MagicMock()
+        client.create_custom_product_page.return_value = {"data": {"id": "cpp-1"}}
+        client.create_custom_product_page_version.return_value = {"data": {"id": "cppv-1"}}
+        client.create_custom_product_page_localization.return_value = {"data": {"id": "cppl-1"}}
+        client.list_app_keywords.return_value = {"data": [{"id": "kw-1"}]}
+        client.add_custom_product_page_search_keywords.return_value = {}
+        client.remove_custom_product_page_search_keywords.return_value = {}
+        client.delete_custom_product_page.return_value = {}
+        with patch("perfectdeckcli.mcp_server.app_store_api.AppStoreConnectClient.from_key_file", return_value=client):
+            page = _json(mcp_server.perfectdeck_create_app_store_custom_product_page(
+                mcp_server.CreateAppStoreCustomProductPageInput(
+                    project_path="proj",
+                    app="prod",
+                    name="Campaign",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            version = _json(mcp_server.perfectdeck_create_app_store_custom_product_page_version(
+                mcp_server.CreateAppStoreCustomProductPageVersionInput(
+                    project_path="proj",
+                    app="prod",
+                    page_id="cpp-1",
+                    deep_link="myapp://campaign",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            loc = _json(mcp_server.perfectdeck_create_app_store_custom_product_page_localization(
+                mcp_server.CreateAppStoreCustomProductPageLocalizationInput(
+                    project_path="proj",
+                    app="prod",
+                    version_id="cppv-1",
+                    locale="en-US",
+                    promotional_text="Try it",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            keywords = _json(mcp_server.perfectdeck_list_app_store_keywords(
+                mcp_server.ListAppStoreKeywordsInput(
+                    project_path="proj",
+                    app="prod",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            link = _json(mcp_server.perfectdeck_link_app_store_custom_product_page_keywords(
+                mcp_server.LinkAppStoreCustomProductPageKeywordsInput(
+                    project_path="proj",
+                    app="prod",
+                    localization_id="cppl-1",
+                    keyword_ids=["kw-1"],
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            unlink = _json(mcp_server.perfectdeck_unlink_app_store_custom_product_page_keywords(
+                mcp_server.UnlinkAppStoreCustomProductPageKeywordsInput(
+                    project_path="proj",
+                    app="prod",
+                    localization_id="cppl-1",
+                    keyword_ids=["kw-1"],
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            deleted = _json(mcp_server.perfectdeck_delete_app_store_custom_product_page(
+                mcp_server.DeleteAppStoreCustomProductPageInput(
+                    project_path="proj",
+                    app="prod",
+                    page_id="cpp-1",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+        assert page["response"]["data"]["id"] == "cpp-1"
+        assert version["response"]["data"]["id"] == "cppv-1"
+        assert loc["response"]["data"]["id"] == "cppl-1"
+        assert keywords["response"]["data"][0]["id"] == "kw-1"
+        assert link["ok"] is True
+        assert unlink["ok"] is True
+        assert deleted["ok"] is True
+        client.create_custom_product_page.assert_called_once()
+        client.create_custom_product_page_version.assert_called_once_with("cpp-1", deep_link="myapp://campaign")
+        client.list_app_keywords.assert_called_once_with("1234567890", locale="en-US", platform="IOS", limit=200)
+        client.add_custom_product_page_search_keywords.assert_called_once_with("cppl-1", ["kw-1"])
+        client.remove_custom_product_page_search_keywords.assert_called_once_with("cppl-1", ["kw-1"])
+
+    def test_app_store_experiment_tools(self, tmp_path):
+        _setup_project(tmp_path)
+        client = MagicMock()
+        client.create_app_store_experiment.return_value = {"data": {"id": "exp-1"}}
+        client.create_app_store_experiment_treatment.return_value = {"data": {"id": "treat-1"}}
+        client.create_app_store_experiment_treatment_localization.return_value = {"data": {"id": "tl-1"}}
+        client.update_app_store_experiment_treatment.return_value = {"data": {"id": "treat-1"}}
+        client.delete_app_store_experiment_treatment.return_value = {}
+        client.delete_app_store_experiment.return_value = {}
+        with patch("perfectdeckcli.mcp_server.app_store_api.AppStoreConnectClient.from_key_file", return_value=client):
+            exp = _json(mcp_server.perfectdeck_create_app_store_experiment(
+                mcp_server.CreateAppStoreExperimentInput(
+                    project_path="proj",
+                    app="prod",
+                    name="Screenshot test",
+                    traffic_proportion=60,
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            treatment = _json(mcp_server.perfectdeck_create_app_store_experiment_treatment(
+                mcp_server.CreateAppStoreExperimentTreatmentInput(
+                    project_path="proj",
+                    app="prod",
+                    experiment_id="exp-1",
+                    name="Treatment A",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            loc = _json(mcp_server.perfectdeck_create_app_store_experiment_treatment_localization(
+                mcp_server.CreateAppStoreExperimentTreatmentLocalizationInput(
+                    project_path="proj",
+                    app="prod",
+                    treatment_id="treat-1",
+                    locale="en-US",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            updated_treatment = _json(mcp_server.perfectdeck_update_app_store_experiment_treatment(
+                mcp_server.UpdateAppStoreExperimentTreatmentInput(
+                    project_path="proj",
+                    app="prod",
+                    treatment_id="treat-1",
+                    name="Treatment B",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            deleted_treatment = _json(mcp_server.perfectdeck_delete_app_store_experiment_treatment(
+                mcp_server.DeleteAppStoreExperimentTreatmentInput(
+                    project_path="proj",
+                    app="prod",
+                    treatment_id="treat-1",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            deleted_exp = _json(mcp_server.perfectdeck_delete_app_store_experiment(
+                mcp_server.DeleteAppStoreExperimentInput(
+                    project_path="proj",
+                    app="prod",
+                    experiment_id="exp-1",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+        assert exp["response"]["data"]["id"] == "exp-1"
+        assert treatment["response"]["data"]["id"] == "treat-1"
+        assert loc["response"]["data"]["id"] == "tl-1"
+        assert updated_treatment["response"]["data"]["id"] == "treat-1"
+        assert deleted_treatment["ok"] is True
+        assert deleted_exp["ok"] is True
+        assert client.create_app_store_experiment.call_args.kwargs["traffic_proportion"] == 60
+        client.update_app_store_experiment_treatment.assert_called_once_with("treat-1", name="Treatment B", app_icon_name=None)
+
+    def test_app_store_preview_upload_tools(self, tmp_path):
+        _setup_project(tmp_path)
+        client = MagicMock()
+        with (
+            patch("perfectdeckcli.mcp_server.app_store_api.AppStoreConnectClient.from_key_file", return_value=client),
+            patch("perfectdeckcli.mcp_server.app_store_api.upload_previews", return_value={"ok": True, "uploaded": 1}) as upload_previews,
+        ):
+            custom = _json(mcp_server.perfectdeck_upload_app_store_custom_product_page_previews(
+                mcp_server.UploadAppStoreCustomProductPagePreviewsInput(
+                    project_path="proj",
+                    app="prod",
+                    localization_id="cppl-1",
+                    preview_type="IPHONE_67",
+                    file_paths=["/tmp/preview.mp4"],
+                    mime_type="video/mp4",
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+            experiment = _json(mcp_server.perfectdeck_upload_app_store_experiment_previews(
+                mcp_server.UploadAppStoreExperimentPreviewsInput(
+                    project_path="proj",
+                    app="prod",
+                    localization_id="tl-1",
+                    preview_type="IPHONE_67",
+                    file_paths=["/tmp/preview.mp4"],
+                    **_app_store_auth_kwargs(),
+                )
+            ))
+        assert custom["ok"] is True
+        assert experiment["ok"] is True
+        assert upload_previews.call_args_list[0].kwargs["target_type"] == "appCustomProductPageLocalizations"
+        assert upload_previews.call_args_list[1].kwargs["target_type"] == "appStoreVersionExperimentTreatmentLocalizations"
 
 
 # ======================================================================

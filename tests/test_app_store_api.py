@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,6 +12,7 @@ from perfectdeckcli.app_store import (
     AppStoreConnectClient,
     _parse_pricing_response,
     fetch_iap_and_subscriptions,
+    parse_gzip_tabular_report,
     fetch_listings,
     push_listings,
     sync_iap_localizations,
@@ -160,6 +162,264 @@ class TestClientRequest:
         result = client.request("GET", "/rate-limited")
         assert result == {"data": "ok"}
         mock_sleep.assert_called_once_with(5.0)
+
+
+class TestReportsAndAnalytics:
+    def test_parse_gzip_tabular_report(self):
+        raw = gzip.compress(b"Date\tUnits\n2026-04-20\t3\n2026-04-21\t5\n")
+        parsed = parse_gzip_tabular_report(raw, max_rows=1)
+        assert parsed["columns"] == ["Date", "Units"]
+        assert parsed["row_count"] == 1
+        assert parsed["rows"][0]["Units"] == "3"
+
+    def test_download_sales_report_uses_expected_filters(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(200, text="")
+        client.session.request.return_value.content = b"gzip-bytes"
+        result = client.download_sales_report(
+            vendor_number="123456",
+            report_type="SUBSCRIPTION",
+            report_sub_type="SUMMARY",
+            frequency="DAILY",
+            report_date="2026-04-20",
+            version="1_3",
+        )
+        assert result == b"gzip-bytes"
+        _, url = client.session.request.call_args.args[:2]
+        assert url == "https://api.appstoreconnect.apple.com/v1/salesReports"
+        params = client.session.request.call_args.kwargs["params"]
+        assert params["filter[vendorNumber]"] == "123456"
+        assert params["filter[reportType]"] == "SUBSCRIPTION"
+        assert params["filter[version]"] == "1_3"
+
+    def test_request_analytics_reports_shape(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(201, {"data": {"id": "req-1"}})
+        result = client.request_analytics_reports("1476097583", access_type="ONE_TIME_SNAPSHOT")
+        assert result["data"]["id"] == "req-1"
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["attributes"]["accessType"] == "ONE_TIME_SNAPSHOT"
+        assert body["data"]["relationships"]["app"]["data"]["id"] == "1476097583"
+
+    def test_analytics_list_endpoints(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(200, {"data": []})
+        client.list_analytics_report_requests("app123", access_type="ONGOING")
+        assert client.session.request.call_args.args[1].endswith("/apps/app123/analyticsReportRequests")
+        assert client.session.request.call_args.kwargs["params"]["filter[accessType]"] == "ONGOING"
+
+        client.list_analytics_reports("req-1")
+        assert client.session.request.call_args.args[1].endswith("/analyticsReportRequests/req-1/reports")
+
+        client.list_analytics_report_instances("report-1", granularity="DAILY", processing_date="2026-04-20")
+        assert client.session.request.call_args.args[1].endswith("/analyticsReports/report-1/instances")
+        assert client.session.request.call_args.kwargs["params"]["filter[processingDate]"] == "2026-04-20"
+
+        client.list_analytics_report_segments("inst-1")
+        assert client.session.request.call_args.args[1].endswith("/analyticsReportInstances/inst-1/segments")
+
+    def test_download_analytics_segment_uses_download_url(self):
+        client = _mock_client()
+        segment = _mock_response(200, {"data": {"attributes": {"url": "https://example.com/segment.gz"}}})
+        download = _mock_response(200, text="")
+        download.content = b"segment-bytes"
+        client.session.request.side_effect = [segment, download]
+        result = client.download_analytics_report_segment("seg-1")
+        assert result == b"segment-bytes"
+        assert client.session.request.call_args.args[1] == "https://example.com/segment.gz"
+
+
+class TestCustomProductPagesAndExperiments:
+    def test_create_custom_product_page_shape(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(201, {"data": {"id": "cpp-1"}})
+        result = client.create_custom_product_page(
+            "app123",
+            "Campaign page",
+            app_store_version_template_id="ver-1",
+        )
+        assert result["data"]["id"] == "cpp-1"
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["type"] == "appCustomProductPages"
+        assert body["data"]["attributes"]["name"] == "Campaign page"
+        assert body["data"]["relationships"]["app"]["data"]["id"] == "app123"
+        assert body["data"]["relationships"]["appStoreVersionTemplate"]["data"]["id"] == "ver-1"
+
+    def test_custom_product_page_version_and_localization_shapes(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(201, {"data": {"id": "v1"}})
+        client.create_custom_product_page_version("cpp-1", deep_link="myapp://campaign")
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["relationships"]["appCustomProductPage"]["data"]["id"] == "cpp-1"
+        assert body["data"]["attributes"]["deepLink"] == "myapp://campaign"
+
+        client.create_custom_product_page_localization("cppv-1", "en-US", promotional_text="Try this")
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["attributes"]["locale"] == "en-US"
+        assert body["data"]["attributes"]["promotionalText"] == "Try this"
+        assert body["data"]["relationships"]["appCustomProductPageVersion"]["data"]["id"] == "cppv-1"
+
+    def test_custom_product_page_update_delete_and_keywords(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(200, {"data": {"id": "cpp-1"}})
+        client.update_custom_product_page_version("cppv-1", deep_link="myapp://new")
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["id"] == "cppv-1"
+        assert body["data"]["attributes"]["deepLink"] == "myapp://new"
+
+        client.update_custom_product_page_localization("cppl-1", promotional_text="Fresh")
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["id"] == "cppl-1"
+        assert body["data"]["attributes"]["promotionalText"] == "Fresh"
+
+        client.add_custom_product_page_search_keywords("cppl-1", ["kw-1", "kw-2"])
+        method, url = client.session.request.call_args.args[:2]
+        assert method == "POST"
+        assert url.endswith("/appCustomProductPageLocalizations/cppl-1/relationships/searchKeywords")
+        assert client.session.request.call_args.kwargs["json"]["data"][0]["id"] == "kw-1"
+
+        client.remove_custom_product_page_search_keywords("cppl-1", ["kw-1"])
+        method, url = client.session.request.call_args.args[:2]
+        assert method == "DELETE"
+        assert url.endswith("/appCustomProductPageLocalizations/cppl-1/relationships/searchKeywords")
+
+        client.list_app_keywords("app123", locale="en-US", platform="IOS", limit=5)
+        _, url = client.session.request.call_args.args[:2]
+        assert url.endswith("/apps/app123/searchKeywords")
+        assert client.session.request.call_args.kwargs["params"]["filter[locale]"] == "en-US"
+        assert client.session.request.call_args.kwargs["params"]["filter[platform]"] == "IOS"
+
+        client.delete_custom_product_page("cpp-1")
+        method, url = client.session.request.call_args.args[:2]
+        assert method == "DELETE"
+        assert url.endswith("/appCustomProductPages/cpp-1")
+
+    def test_create_experiment_shape(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(201, {"data": {"id": "exp-1"}})
+        result = client.create_app_store_experiment(
+            "app123",
+            name="Screenshot test",
+            platform="IOS",
+            traffic_proportion=50,
+        )
+        assert result["data"]["id"] == "exp-1"
+        _, url = client.session.request.call_args.args[:2]
+        assert url == "https://api.appstoreconnect.apple.com/v2/appStoreVersionExperiments"
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["attributes"]["name"] == "Screenshot test"
+        assert body["data"]["attributes"]["trafficProportion"] == 50
+        assert body["data"]["relationships"]["app"]["data"]["id"] == "app123"
+
+    def test_create_experiment_treatment_and_localization_shapes(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(201, {"data": {"id": "treat-1"}})
+        client.create_app_store_experiment_treatment(
+            "exp-1",
+            name="Treatment A",
+            app_icon_name="AltIcon",
+        )
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["attributes"]["appIconName"] == "AltIcon"
+        assert body["data"]["relationships"]["appStoreVersionExperimentV2"]["data"]["id"] == "exp-1"
+
+        client.create_app_store_experiment_treatment_localization("treat-1", "fr-FR")
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["attributes"]["locale"] == "fr-FR"
+        assert body["data"]["relationships"]["appStoreVersionExperimentTreatment"]["data"]["id"] == "treat-1"
+
+        client.update_app_store_experiment_treatment("treat-1", name="Treatment B", app_icon_name="AltIconB")
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["id"] == "treat-1"
+        assert body["data"]["attributes"]["name"] == "Treatment B"
+        assert body["data"]["attributes"]["appIconName"] == "AltIconB"
+
+        client.delete_app_store_experiment_treatment("treat-1")
+        method, url = client.session.request.call_args.args[:2]
+        assert method == "DELETE"
+        assert url.endswith("/appStoreVersionExperimentTreatments/treat-1")
+
+        client.delete_app_store_experiment("exp-1")
+        method, url = client.session.request.call_args.args[:2]
+        assert method == "DELETE"
+        assert url.endswith("/v2/appStoreVersionExperiments/exp-1")
+
+    def test_create_screenshot_set_supports_custom_and_experiment_targets(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(201, {"data": {"id": "set-1"}})
+        client.create_app_screenshot_set(
+            "cpp-loc-1",
+            "APP_IPHONE_67",
+            target_type="appCustomProductPageLocalizations",
+        )
+        body = client.session.request.call_args.kwargs["json"]
+        assert "appCustomProductPageLocalization" in body["data"]["relationships"]
+        assert body["data"]["relationships"]["appCustomProductPageLocalization"]["data"]["id"] == "cpp-loc-1"
+
+        client.create_app_screenshot_set(
+            "exp-loc-1",
+            "APP_IPHONE_67",
+            target_type="appStoreVersionExperimentTreatmentLocalizations",
+        )
+        body = client.session.request.call_args.kwargs["json"]
+        assert "appStoreVersionExperimentTreatmentLocalization" in body["data"]["relationships"]
+
+    def test_create_preview_set_and_preview_supports_custom_and_experiment_targets(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(201, {"data": {"id": "preview-set-1"}})
+        client.create_app_preview_set(
+            "cpp-loc-1",
+            "IPHONE_67",
+            target_type="appCustomProductPageLocalizations",
+        )
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["attributes"]["previewType"] == "IPHONE_67"
+        assert "appCustomProductPageLocalization" in body["data"]["relationships"]
+
+        client.create_app_preview_set(
+            "exp-loc-1",
+            "IPHONE_67",
+            target_type="appStoreVersionExperimentTreatmentLocalizations",
+        )
+        body = client.session.request.call_args.kwargs["json"]
+        assert "appStoreVersionExperimentTreatmentLocalization" in body["data"]["relationships"]
+
+        client.create_app_preview(
+            "preview-set-1",
+            "preview.mp4",
+            123,
+            mime_type="video/mp4",
+            preview_frame_time_code="00:00:05:00",
+        )
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["relationships"]["appPreviewSet"]["data"]["id"] == "preview-set-1"
+        assert body["data"]["attributes"]["mimeType"] == "video/mp4"
+        assert body["data"]["attributes"]["previewFrameTimeCode"] == "00:00:05:00"
+
+        client.complete_app_preview_upload("preview-1", "abc", preview_frame_time_code="00:00:05:00")
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["attributes"]["uploaded"] is True
+        assert body["data"]["attributes"]["sourceFileChecksum"] == "abc"
+
+    def test_review_submission_shapes(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(201, {"data": {"id": "sub-1"}})
+        client.create_review_submission("app123", platform="IOS")
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["relationships"]["app"]["data"]["id"] == "app123"
+        assert body["data"]["attributes"]["platform"] == "IOS"
+
+        client.add_review_submission_item(
+            "sub-1",
+            resource_type="appCustomProductPageVersions",
+            resource_id="cppv-1",
+        )
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["relationships"]["appCustomProductPageVersion"]["data"]["id"] == "cppv-1"
+
+        client.submit_review_submission("sub-1")
+        body = client.session.request.call_args.kwargs["json"]
+        assert body["data"]["attributes"]["submitted"] is True
 
 
 # ======================================================================

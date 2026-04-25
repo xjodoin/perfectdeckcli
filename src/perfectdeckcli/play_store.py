@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import csv
+import gzip
 import hashlib
+import io
 import json
 import logging
 import os
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Sequence
+from urllib.parse import quote
 
+from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -194,6 +200,211 @@ def create_service(
 
     credentials = Credentials.from_service_account_info(info_data, scopes=scopes)
     return build("androidpublisher", "v3", credentials=credentials, cache_discovery=False)
+
+
+def _load_service_account_credentials(
+    credentials_path: str | None,
+    env_var: str,
+    scopes: Sequence[str],
+) -> Credentials:
+    """Load service-account credentials from a path or env var."""
+    if credentials_path is not None:
+        path = Path(credentials_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Service account JSON not found at {path}.")
+        return Credentials.from_service_account_file(str(path), scopes=list(scopes))
+
+    env_value = os.getenv(env_var)
+    if not env_value:
+        raise FileNotFoundError(
+            f"Service account JSON not provided. Pass credentials_path or set the {env_var} environment variable."
+        )
+    env_value = env_value.strip()
+    try:
+        info_data = json.loads(env_value)
+    except json.JSONDecodeError:
+        path = Path(env_value).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Service account file referenced by {env_var} not found: {path}.")
+        try:
+            info_data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Service account file referenced by {env_var} is not valid JSON: {path}.") from exc
+    return Credentials.from_service_account_info(info_data, scopes=list(scopes))
+
+
+def create_reporting_service(
+    credentials_path: str | None = None,
+    env_var: str = "PLAY_SERVICE_ACCOUNT_JSON",
+    *,
+    version: str = "v1beta1",
+) -> Any:
+    """Build a Play Developer Reporting service for Android vitals metrics."""
+    credentials = _load_service_account_credentials(
+        credentials_path,
+        env_var,
+        ["https://www.googleapis.com/auth/playdeveloperreporting"],
+    )
+    return build("playdeveloperreporting", version, credentials=credentials, cache_discovery=False)
+
+
+def create_storage_session(
+    credentials_path: str | None = None,
+    env_var: str = "PLAY_SERVICE_ACCOUNT_JSON",
+) -> AuthorizedSession:
+    """Create an authorized session for Play Console Cloud Storage report exports."""
+    credentials = _load_service_account_credentials(
+        credentials_path,
+        env_var,
+        ["https://www.googleapis.com/auth/devstorage.read_only"],
+    )
+    return AuthorizedSession(credentials)
+
+
+VITALS_METRIC_SETS: Mapping[str, tuple[str, str]] = {
+    "anr_rate": ("anrrate", "anrRateMetricSet"),
+    "crash_rate": ("crashrate", "crashRateMetricSet"),
+    "error_count": ("errors.counts", "errorCountMetricSet"),
+    "excessive_wakeup_rate": ("excessivewakeuprate", "excessiveWakeupRateMetricSet"),
+    "lmk_rate": ("lmkrate", "lmkRateMetricSet"),
+    "slow_rendering_rate": ("slowrenderingrate", "slowRenderingRateMetricSet"),
+    "slow_start_rate": ("slowstartrate", "slowStartRateMetricSet"),
+    "stuck_background_wakelock_rate": ("stuckbackgroundwakelockrate", "stuckBackgroundWakelockRateMetricSet"),
+}
+
+
+def _date_to_play_datetime(date_value: str, timezone_id: str) -> Dict[str, Any]:
+    year, month, day = (int(part) for part in date_value.split("-", 2))
+    return {
+        "year": year,
+        "month": month,
+        "day": day,
+        "timeZone": {"id": timezone_id},
+    }
+
+
+def _reporting_metric_resource(service: Any, resource_path: str) -> Any:
+    resource = service.vitals()
+    for part in resource_path.split("."):
+        resource = getattr(resource, part)()
+    return resource
+
+
+def query_vitals_metric(
+    service: Any,
+    package_name: str,
+    metric_set: str,
+    *,
+    start_date: str,
+    end_date: str,
+    dimensions: Sequence[str] | None = None,
+    metrics: Sequence[str] | None = None,
+    aggregation_period: str = "DAILY",
+    timezone_id: str = "America/Los_Angeles",
+    filter_expr: str | None = None,
+    user_cohort: str | None = None,
+    page_size: int = 1000,
+    page_token: str | None = None,
+) -> Dict[str, Any]:
+    """Query a Play Developer Reporting Android vitals metric set."""
+    if metric_set not in VITALS_METRIC_SETS:
+        raise ValueError(f"Unsupported metric_set {metric_set!r}. Must be one of {sorted(VITALS_METRIC_SETS)}.")
+    resource_path, api_name = VITALS_METRIC_SETS[metric_set]
+    body: Dict[str, Any] = {
+        "timelineSpec": {
+            "startTime": _date_to_play_datetime(start_date, timezone_id),
+            "endTime": _date_to_play_datetime(end_date, timezone_id),
+            "aggregationPeriod": aggregation_period,
+        },
+        "pageSize": page_size,
+    }
+    if dimensions:
+        body["dimensions"] = list(dimensions)
+    if metrics:
+        body["metrics"] = list(metrics)
+    if filter_expr:
+        body["filter"] = filter_expr
+    if user_cohort:
+        body["userCohort"] = user_cohort
+    if page_token:
+        body["pageToken"] = page_token
+
+    request = _reporting_metric_resource(service, resource_path).query(
+        name=f"apps/{package_name}/{api_name}",
+        body=body,
+    )
+    return _execute_with_retry(request)
+
+
+def search_reporting_apps(service: Any, *, page_size: int = 100, page_token: str | None = None) -> Dict[str, Any]:
+    """List apps visible to the Play Developer Reporting API principal."""
+    request = service.apps().search(pageSize=page_size, pageToken=page_token)
+    return _execute_with_retry(request)
+
+
+def list_play_report_objects(
+    session: AuthorizedSession,
+    bucket: str,
+    *,
+    prefix: str = "",
+    page_size: int = 1000,
+    page_token: str | None = None,
+) -> Dict[str, Any]:
+    """List Play Console report files in the developer Cloud Storage bucket."""
+    params: Dict[str, Any] = {"maxResults": page_size}
+    if prefix:
+        params["prefix"] = prefix
+    if page_token:
+        params["pageToken"] = page_token
+    response = session.get(f"https://storage.googleapis.com/storage/v1/b/{bucket}/o", params=params, timeout=60)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Google Cloud Storage API error {response.status_code}: {response.text}")
+    return response.json()
+
+
+def download_play_report_object(
+    session: AuthorizedSession,
+    bucket: str,
+    object_name: str,
+) -> bytes:
+    """Download a raw Play Console report object from Cloud Storage."""
+    encoded_name = quote(object_name, safe="")
+    response = session.get(
+        f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{encoded_name}",
+        params={"alt": "media"},
+        timeout=120,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Google Cloud Storage API error {response.status_code}: {response.text}")
+    return response.content
+
+
+def parse_play_report_content(
+    content: bytes,
+    *,
+    max_rows: int | None = None,
+    encoding: str = "utf-16",
+) -> Dict[str, Any]:
+    """Parse a Play Console CSV export, including gzip or zip wrappers."""
+    if content[:2] == b"\x1f\x8b":
+        content = gzip.decompress(content)
+    if content[:4] == b"PK\x03\x04":
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            csv_names = [name for name in archive.namelist() if not name.endswith("/")]
+            if not csv_names:
+                return {"rows": [], "row_count": 0, "columns": [], "text": ""}
+            content = archive.read(csv_names[0])
+    try:
+        text = content.decode(encoding)
+    except UnicodeDecodeError:
+        text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    rows: List[Dict[str, str]] = []
+    for idx, row in enumerate(reader):
+        if max_rows is not None and idx >= max_rows:
+            break
+        rows.append(dict(row))
+    return {"text": text, "rows": rows, "row_count": len(rows), "columns": reader.fieldnames or []}
 
 
 # ---------------------------------------------------------------------------

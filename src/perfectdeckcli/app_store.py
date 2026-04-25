@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import csv
+import gzip
 import hashlib
+import io
 import logging
+import mimetypes
 import random
 import time
 from datetime import datetime, timedelta, timezone
@@ -170,6 +174,53 @@ class AppStoreConnectClient:
             )
             raise RuntimeError(f"App Store Connect API error {status}: {response.text}")
 
+    def request_raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, str] | None = None,
+        accept: str = "*/*",
+    ) -> bytes:
+        """Send an authenticated request and return the raw response bytes."""
+        if path.startswith("http://") or path.startswith("https://"):
+            url = path
+        elif path.startswith("/v1/") or path.startswith("/v2/") or path.startswith("/v3/"):
+            base_domain = self.base_url.rsplit("/v", 1)[0]
+            url = f"{base_domain}{path}"
+        else:
+            url = f"{self.base_url}{path}"
+        method_upper = (method or "GET").upper()
+        headers = {
+            "Authorization": self._authorization_header(),
+            "Accept": accept,
+        }
+
+        max_attempts = 4
+        attempt = 0
+        while True:
+            attempt += 1
+            response = self.session.request(
+                method_upper, url, params=params, headers=headers, timeout=60,
+            )
+            status = response.status_code
+            if status < 400:
+                return response.content
+
+            transient = status in {429, 500, 502, 503, 504}
+            if transient and method_upper == "GET" and attempt < max_attempts:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    wait_seconds = float(retry_after) if retry_after is not None else None
+                except ValueError:
+                    wait_seconds = None
+                if wait_seconds is None:
+                    wait_seconds = 1.0 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                time.sleep(wait_seconds)
+                continue
+
+            raise RuntimeError(f"App Store Connect API error {status}: {response.text}")
+
     # ------------------------------------------------------------------
     # App lookup
     # ------------------------------------------------------------------
@@ -185,6 +236,103 @@ class AppStoreConnectClient:
         if not items:
             return None
         return items[0]["id"]
+
+    # ------------------------------------------------------------------
+    # Reporting and analytics
+    # ------------------------------------------------------------------
+
+    def download_sales_report(
+        self,
+        *,
+        vendor_number: str,
+        report_type: str = "SALES",
+        report_sub_type: str = "SUMMARY",
+        frequency: str = "DAILY",
+        report_date: str | None = None,
+        version: str | None = None,
+    ) -> bytes:
+        """Download a gzip Sales and Trends report from App Store Connect."""
+        params = {
+            "filter[vendorNumber]": vendor_number,
+            "filter[reportType]": report_type,
+            "filter[reportSubType]": report_sub_type,
+            "filter[frequency]": frequency,
+        }
+        if report_date:
+            params["filter[reportDate]"] = report_date
+        if version:
+            params["filter[version]"] = version
+        return self.request_raw("GET", "/salesReports", params=params, accept="application/a-gzip")
+
+    def request_analytics_reports(self, app_id: str, access_type: str = "ONGOING") -> Mapping[str, Any]:
+        """Create an Analytics Reports request for an app."""
+        return self.request(
+            "POST",
+            "/analyticsReportRequests",
+            json_body={
+                "data": {
+                    "type": "analyticsReportRequests",
+                    "attributes": {"accessType": access_type},
+                    "relationships": {
+                        "app": {"data": {"type": "apps", "id": app_id}},
+                    },
+                },
+            },
+        )
+
+    def list_analytics_report_requests(
+        self,
+        app_id: str,
+        *,
+        access_type: str | None = None,
+        limit: int = 50,
+    ) -> Mapping[str, Any]:
+        """List Analytics Reports requests already configured for an app."""
+        params = {"limit": str(limit)}
+        if access_type:
+            params["filter[accessType]"] = access_type
+        return self.request("GET", f"/apps/{app_id}/analyticsReportRequests", params=params)
+
+    def list_analytics_reports(self, request_id: str, *, limit: int = 200) -> Mapping[str, Any]:
+        """List report definitions generated for an Analytics Reports request."""
+        return self.request("GET", f"/analyticsReportRequests/{request_id}/reports", params={"limit": str(limit)})
+
+    def list_analytics_report_instances(
+        self,
+        report_id: str,
+        *,
+        granularity: str | None = None,
+        processing_date: str | None = None,
+        limit: int = 200,
+    ) -> Mapping[str, Any]:
+        """List downloadable instances for one Analytics report."""
+        params = {"limit": str(limit)}
+        if granularity:
+            params["filter[granularity]"] = granularity
+        if processing_date:
+            params["filter[processingDate]"] = processing_date
+        return self.request("GET", f"/analyticsReports/{report_id}/instances", params=params)
+
+    def list_analytics_report_segments(self, instance_id: str, *, limit: int = 200) -> Mapping[str, Any]:
+        """List downloadable file segments for one Analytics report instance."""
+        return self.request("GET", f"/analyticsReportInstances/{instance_id}/segments", params={"limit": str(limit)})
+
+    def get_analytics_report_segment(self, segment_id: str) -> Mapping[str, Any]:
+        """Read segment metadata, including Apple's download URL when available."""
+        return self.request("GET", f"/analyticsReportSegments/{segment_id}")
+
+    def download_analytics_report_segment(self, segment_id: str) -> bytes:
+        """Download one compressed Analytics report segment."""
+        metadata = self.get_analytics_report_segment(segment_id)
+        segment = metadata.get("data", {})
+        attributes = segment.get("attributes", {}) if isinstance(segment, Mapping) else {}
+        url = attributes.get("url")
+        if not url:
+            links = segment.get("links", {}) if isinstance(segment, Mapping) else {}
+            url = links.get("self")
+        if not url:
+            raise RuntimeError(f"No download URL found for analytics report segment {segment_id}.")
+        return self.request_raw("GET", str(url), accept="application/a-gzip")
 
     # ------------------------------------------------------------------
     # App info ID resolution
@@ -523,20 +671,41 @@ class AppStoreConnectClient:
     # ------------------------------------------------------------------
 
     def list_app_screenshot_sets(
-        self, version_localization_id: str,
+        self,
+        version_localization_id: str,
+        *,
+        target_type: str = "appStoreVersionLocalizations",
     ) -> List[Dict[str, Any]]:
-        """List screenshot sets for a version localization."""
+        """List screenshot sets for a version, custom page, or experiment localization."""
+        path_prefix = {
+            "appStoreVersionLocalizations": "appStoreVersionLocalizations",
+            "appCustomProductPageLocalizations": "appCustomProductPageLocalizations",
+            "appStoreVersionExperimentTreatmentLocalizations": "appStoreVersionExperimentTreatmentLocalizations",
+        }.get(target_type)
+        if path_prefix is None:
+            raise ValueError(f"Unsupported screenshot localization target_type: {target_type}")
         data = self.request(
             "GET",
-            f"/appStoreVersionLocalizations/{version_localization_id}/appScreenshotSets",
+            f"/{path_prefix}/{version_localization_id}/appScreenshotSets",
             params={"limit": "50"},
         )
         return list(data.get("data", []))
 
     def create_app_screenshot_set(
-        self, version_localization_id: str, display_type: str,
+        self,
+        version_localization_id: str,
+        display_type: str,
+        *,
+        target_type: str = "appStoreVersionLocalizations",
     ) -> str:
-        """Create a screenshot set. Returns set ID."""
+        """Create a screenshot set for a version, custom page, or experiment localization."""
+        relationship_name = {
+            "appStoreVersionLocalizations": "appStoreVersionLocalization",
+            "appCustomProductPageLocalizations": "appCustomProductPageLocalization",
+            "appStoreVersionExperimentTreatmentLocalizations": "appStoreVersionExperimentTreatmentLocalization",
+        }.get(target_type)
+        if relationship_name is None:
+            raise ValueError(f"Unsupported screenshot localization target_type: {target_type}")
         data = self.request(
             "POST",
             "/appScreenshotSets",
@@ -545,9 +714,9 @@ class AppStoreConnectClient:
                     "type": "appScreenshotSets",
                     "attributes": {"screenshotDisplayType": display_type},
                     "relationships": {
-                        "appStoreVersionLocalization": {
+                        relationship_name: {
                             "data": {
-                                "type": "appStoreVersionLocalizations",
+                                "type": target_type,
                                 "id": version_localization_id,
                             }
                         }
@@ -624,6 +793,596 @@ class AppStoreConnectClient:
                         "uploaded": True,
                         "sourceFileChecksum": checksum,
                     },
+                }
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # App preview management
+    # ------------------------------------------------------------------
+
+    def list_app_preview_sets(
+        self,
+        version_localization_id: str,
+        *,
+        target_type: str = "appStoreVersionLocalizations",
+    ) -> List[Dict[str, Any]]:
+        """List app preview sets for a version, custom page, or experiment localization."""
+        path_prefix = {
+            "appStoreVersionLocalizations": "appStoreVersionLocalizations",
+            "appCustomProductPageLocalizations": "appCustomProductPageLocalizations",
+            "appStoreVersionExperimentTreatmentLocalizations": "appStoreVersionExperimentTreatmentLocalizations",
+        }.get(target_type)
+        if path_prefix is None:
+            raise ValueError(f"Unsupported app preview localization target_type: {target_type}")
+        data = self.request(
+            "GET",
+            f"/{path_prefix}/{version_localization_id}/appPreviewSets",
+            params={"limit": "50"},
+        )
+        return list(data.get("data", []))
+
+    def create_app_preview_set(
+        self,
+        version_localization_id: str,
+        preview_type: str,
+        *,
+        target_type: str = "appStoreVersionLocalizations",
+    ) -> str:
+        """Create an app preview set for a version, custom page, or experiment localization."""
+        relationship_name = {
+            "appStoreVersionLocalizations": "appStoreVersionLocalization",
+            "appCustomProductPageLocalizations": "appCustomProductPageLocalization",
+            "appStoreVersionExperimentTreatmentLocalizations": "appStoreVersionExperimentTreatmentLocalization",
+        }.get(target_type)
+        if relationship_name is None:
+            raise ValueError(f"Unsupported app preview localization target_type: {target_type}")
+        data = self.request(
+            "POST",
+            "/appPreviewSets",
+            json_body={
+                "data": {
+                    "type": "appPreviewSets",
+                    "attributes": {"previewType": preview_type},
+                    "relationships": {
+                        relationship_name: {
+                            "data": {
+                                "type": target_type,
+                                "id": version_localization_id,
+                            }
+                        }
+                    },
+                }
+            },
+        )
+        return data.get("data", {}).get("id", "")
+
+    def list_app_previews(self, preview_set_id: str) -> List[Dict[str, Any]]:
+        """List app previews in a preview set."""
+        data = self.request(
+            "GET",
+            f"/appPreviewSets/{preview_set_id}/appPreviews",
+            params={"limit": "50"},
+        )
+        return list(data.get("data", []))
+
+    def delete_app_preview(self, preview_id: str) -> None:
+        """Delete an app preview."""
+        self.request("DELETE", f"/appPreviews/{preview_id}")
+
+    def create_app_preview(
+        self,
+        preview_set_id: str,
+        file_name: str,
+        file_size: int,
+        *,
+        mime_type: str | None = None,
+        preview_frame_time_code: str | None = None,
+    ) -> Dict[str, Any]:
+        """Reserve an app preview upload slot. Returns resource with uploadOperations."""
+        attributes: Dict[str, Any] = {"fileName": file_name, "fileSize": file_size}
+        if mime_type is not None:
+            attributes["mimeType"] = mime_type
+        if preview_frame_time_code is not None:
+            attributes["previewFrameTimeCode"] = preview_frame_time_code
+        data = self.request(
+            "POST",
+            "/appPreviews",
+            json_body={
+                "data": {
+                    "type": "appPreviews",
+                    "attributes": attributes,
+                    "relationships": {
+                        "appPreviewSet": {
+                            "data": {"type": "appPreviewSets", "id": preview_set_id}
+                        }
+                    },
+                }
+            },
+        )
+        return dict(data.get("data", {}))
+
+    def complete_app_preview_upload(
+        self,
+        preview_id: str,
+        checksum: str,
+        *,
+        preview_frame_time_code: str | None = None,
+    ) -> None:
+        """Mark an app preview upload as complete."""
+        attributes: Dict[str, Any] = {
+            "uploaded": True,
+            "sourceFileChecksum": checksum,
+        }
+        if preview_frame_time_code is not None:
+            attributes["previewFrameTimeCode"] = preview_frame_time_code
+        self.request(
+            "PATCH",
+            f"/appPreviews/{preview_id}",
+            json_body={
+                "data": {
+                    "type": "appPreviews",
+                    "id": preview_id,
+                    "attributes": attributes,
+                }
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Custom product pages
+    # ------------------------------------------------------------------
+
+    def list_custom_product_pages(self, app_id: str, *, limit: int = 200) -> Mapping[str, Any]:
+        """List custom product pages for an app."""
+        return self.request("GET", f"/apps/{app_id}/appCustomProductPages", params={"limit": str(limit)})
+
+    def create_custom_product_page(
+        self,
+        app_id: str,
+        name: str,
+        *,
+        app_store_version_template_id: str | None = None,
+        custom_product_page_template_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Create a custom product page."""
+        relationships: Dict[str, Any] = {
+            "app": {"data": {"type": "apps", "id": app_id}},
+        }
+        if app_store_version_template_id:
+            relationships["appStoreVersionTemplate"] = {
+                "data": {"type": "appStoreVersions", "id": app_store_version_template_id}
+            }
+        if custom_product_page_template_id:
+            relationships["customProductPageTemplate"] = {
+                "data": {"type": "appCustomProductPages", "id": custom_product_page_template_id}
+            }
+        return self.request(
+            "POST",
+            "/appCustomProductPages",
+            json_body={
+                "data": {
+                    "type": "appCustomProductPages",
+                    "attributes": {"name": name},
+                    "relationships": relationships,
+                }
+            },
+        )
+
+    def update_custom_product_page(
+        self,
+        page_id: str,
+        *,
+        name: str | None = None,
+        visible: bool | None = None,
+    ) -> Mapping[str, Any]:
+        """Update a custom product page name or visibility."""
+        attributes: Dict[str, Any] = {}
+        if name is not None:
+            attributes["name"] = name
+        if visible is not None:
+            attributes["visible"] = visible
+        return self.request(
+            "PATCH",
+            f"/appCustomProductPages/{page_id}",
+            json_body={
+                "data": {
+                    "type": "appCustomProductPages",
+                    "id": page_id,
+                    "attributes": attributes,
+                }
+            },
+        )
+
+    def delete_custom_product_page(self, page_id: str) -> Mapping[str, Any]:
+        """Delete a custom product page."""
+        return self.request("DELETE", f"/appCustomProductPages/{page_id}")
+
+    def list_custom_product_page_versions(self, page_id: str, *, limit: int = 200) -> Mapping[str, Any]:
+        """List versions for a custom product page."""
+        return self.request("GET", f"/appCustomProductPages/{page_id}/appCustomProductPageVersions", params={"limit": str(limit)})
+
+    def create_custom_product_page_version(
+        self,
+        page_id: str,
+        *,
+        deep_link: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Create a custom product page version."""
+        attributes: Dict[str, Any] = {}
+        if deep_link is not None:
+            attributes["deepLink"] = deep_link
+        return self.request(
+            "POST",
+            "/appCustomProductPageVersions",
+            json_body={
+                "data": {
+                    "type": "appCustomProductPageVersions",
+                    "attributes": attributes,
+                    "relationships": {
+                        "appCustomProductPage": {
+                            "data": {"type": "appCustomProductPages", "id": page_id}
+                        }
+                    },
+                }
+            },
+        )
+
+    def update_custom_product_page_version(
+        self,
+        version_id: str,
+        *,
+        deep_link: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Update a custom product page version."""
+        attributes: Dict[str, Any] = {}
+        if deep_link is not None:
+            attributes["deepLink"] = deep_link
+        return self.request(
+            "PATCH",
+            f"/appCustomProductPageVersions/{version_id}",
+            json_body={
+                "data": {
+                    "type": "appCustomProductPageVersions",
+                    "id": version_id,
+                    "attributes": attributes,
+                }
+            },
+        )
+
+    def list_custom_product_page_localizations(self, version_id: str, *, limit: int = 200) -> Mapping[str, Any]:
+        """List localizations for a custom product page version."""
+        return self.request(
+            "GET",
+            f"/appCustomProductPageVersions/{version_id}/appCustomProductPageLocalizations",
+            params={"limit": str(limit)},
+        )
+
+    def create_custom_product_page_localization(
+        self,
+        version_id: str,
+        locale: str,
+        *,
+        promotional_text: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Create a custom product page localization."""
+        attributes: Dict[str, Any] = {"locale": locale}
+        if promotional_text is not None:
+            attributes["promotionalText"] = promotional_text
+        return self.request(
+            "POST",
+            "/appCustomProductPageLocalizations",
+            json_body={
+                "data": {
+                    "type": "appCustomProductPageLocalizations",
+                    "attributes": attributes,
+                    "relationships": {
+                        "appCustomProductPageVersion": {
+                            "data": {"type": "appCustomProductPageVersions", "id": version_id}
+                        }
+                    },
+                }
+            },
+        )
+
+    def update_custom_product_page_localization(
+        self,
+        localization_id: str,
+        *,
+        promotional_text: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Update a custom product page localization."""
+        attributes: Dict[str, Any] = {}
+        if promotional_text is not None:
+            attributes["promotionalText"] = promotional_text
+        return self.request(
+            "PATCH",
+            f"/appCustomProductPageLocalizations/{localization_id}",
+            json_body={
+                "data": {
+                    "type": "appCustomProductPageLocalizations",
+                    "id": localization_id,
+                    "attributes": attributes,
+                }
+            },
+        )
+
+    def list_app_keywords(
+        self,
+        app_id: str,
+        *,
+        locale: str,
+        platform: str,
+        limit: int = 200,
+    ) -> Mapping[str, Any]:
+        """List app keyword resources available for custom page search visibility."""
+        return self.request(
+            "GET",
+            f"/apps/{app_id}/searchKeywords",
+            params={
+                "filter[locale]": locale,
+                "filter[platform]": platform,
+                "limit": str(limit),
+            },
+        )
+
+    def add_custom_product_page_search_keywords(
+        self,
+        localization_id: str,
+        keyword_ids: Sequence[str],
+    ) -> Mapping[str, Any]:
+        """Associate keyword IDs with a custom product page localization."""
+        return self.request(
+            "POST",
+            f"/appCustomProductPageLocalizations/{localization_id}/relationships/searchKeywords",
+            json_body={
+                "data": [
+                    {"type": "appKeywords", "id": keyword_id}
+                    for keyword_id in keyword_ids
+                ]
+            },
+        )
+
+    def remove_custom_product_page_search_keywords(
+        self,
+        localization_id: str,
+        keyword_ids: Sequence[str],
+    ) -> Mapping[str, Any]:
+        """Remove keyword associations from a custom product page localization."""
+        return self.request(
+            "DELETE",
+            f"/appCustomProductPageLocalizations/{localization_id}/relationships/searchKeywords",
+            json_body={
+                "data": [
+                    {"type": "appKeywords", "id": keyword_id}
+                    for keyword_id in keyword_ids
+                ]
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Product page optimization experiments
+    # ------------------------------------------------------------------
+
+    def list_app_store_experiments(self, app_id: str, *, limit: int = 200) -> Mapping[str, Any]:
+        """List product page optimization experiments for an app."""
+        return self.request("GET", f"/apps/{app_id}/appStoreVersionExperimentsV2", params={"limit": str(limit)})
+
+    def create_app_store_experiment(
+        self,
+        app_id: str,
+        *,
+        name: str,
+        platform: str = "IOS",
+        traffic_proportion: int = 50,
+    ) -> Mapping[str, Any]:
+        """Create an App Store product page optimization experiment."""
+        return self.request(
+            "POST",
+            "/v2/appStoreVersionExperiments",
+            json_body={
+                "data": {
+                    "type": "appStoreVersionExperiments",
+                    "attributes": {
+                        "name": name,
+                        "platform": platform,
+                        "trafficProportion": traffic_proportion,
+                    },
+                    "relationships": {
+                        "app": {"data": {"type": "apps", "id": app_id}},
+                    },
+                }
+            },
+        )
+
+    def update_app_store_experiment(
+        self,
+        experiment_id: str,
+        *,
+        name: str | None = None,
+        traffic_proportion: int | None = None,
+        started: bool | None = None,
+    ) -> Mapping[str, Any]:
+        """Update an App Store product page optimization experiment."""
+        attributes: Dict[str, Any] = {}
+        if name is not None:
+            attributes["name"] = name
+        if traffic_proportion is not None:
+            attributes["trafficProportion"] = traffic_proportion
+        if started is not None:
+            attributes["started"] = started
+        return self.request(
+            "PATCH",
+            f"/v2/appStoreVersionExperiments/{experiment_id}",
+            json_body={
+                "data": {
+                    "type": "appStoreVersionExperiments",
+                    "id": experiment_id,
+                    "attributes": attributes,
+                }
+            },
+        )
+
+    def delete_app_store_experiment(self, experiment_id: str) -> Mapping[str, Any]:
+        """Delete a product page optimization experiment before it starts."""
+        return self.request("DELETE", f"/v2/appStoreVersionExperiments/{experiment_id}")
+
+    def list_app_store_experiment_treatments(self, experiment_id: str, *, limit: int = 200) -> Mapping[str, Any]:
+        """List treatments for a product page optimization experiment."""
+        return self.request("GET", f"/v2/appStoreVersionExperiments/{experiment_id}/appStoreVersionExperimentTreatments", params={"limit": str(limit)})
+
+    def create_app_store_experiment_treatment(
+        self,
+        experiment_id: str,
+        *,
+        name: str,
+        app_icon_name: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Create an experiment treatment."""
+        attributes: Dict[str, Any] = {"name": name}
+        if app_icon_name is not None:
+            attributes["appIconName"] = app_icon_name
+        return self.request(
+            "POST",
+            "/appStoreVersionExperimentTreatments",
+            json_body={
+                "data": {
+                    "type": "appStoreVersionExperimentTreatments",
+                    "attributes": attributes,
+                    "relationships": {
+                        "appStoreVersionExperimentV2": {
+                            "data": {"type": "appStoreVersionExperiments", "id": experiment_id}
+                        }
+                    },
+                }
+            },
+        )
+
+    def update_app_store_experiment_treatment(
+        self,
+        treatment_id: str,
+        *,
+        name: str | None = None,
+        app_icon_name: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Update an experiment treatment."""
+        attributes: Dict[str, Any] = {}
+        if name is not None:
+            attributes["name"] = name
+        if app_icon_name is not None:
+            attributes["appIconName"] = app_icon_name
+        return self.request(
+            "PATCH",
+            f"/appStoreVersionExperimentTreatments/{treatment_id}",
+            json_body={
+                "data": {
+                    "type": "appStoreVersionExperimentTreatments",
+                    "id": treatment_id,
+                    "attributes": attributes,
+                }
+            },
+        )
+
+    def delete_app_store_experiment_treatment(self, treatment_id: str) -> Mapping[str, Any]:
+        """Delete an experiment treatment."""
+        return self.request("DELETE", f"/appStoreVersionExperimentTreatments/{treatment_id}")
+
+    def list_app_store_experiment_treatment_localizations(self, treatment_id: str, *, limit: int = 200) -> Mapping[str, Any]:
+        """List treatment localizations."""
+        return self.request(
+            "GET",
+            f"/appStoreVersionExperimentTreatments/{treatment_id}/appStoreVersionExperimentTreatmentLocalizations",
+            params={"limit": str(limit)},
+        )
+
+    def create_app_store_experiment_treatment_localization(
+        self,
+        treatment_id: str,
+        locale: str,
+    ) -> Mapping[str, Any]:
+        """Create a treatment localization."""
+        return self.request(
+            "POST",
+            "/appStoreVersionExperimentTreatmentLocalizations",
+            json_body={
+                "data": {
+                    "type": "appStoreVersionExperimentTreatmentLocalizations",
+                    "attributes": {"locale": locale},
+                    "relationships": {
+                        "appStoreVersionExperimentTreatment": {
+                            "data": {"type": "appStoreVersionExperimentTreatments", "id": treatment_id}
+                        }
+                    },
+                }
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Review submissions for custom pages and experiments
+    # ------------------------------------------------------------------
+
+    def create_review_submission(self, app_id: str, *, platform: str | None = None) -> Mapping[str, Any]:
+        """Create a review submission container."""
+        attributes: Dict[str, Any] = {}
+        if platform is not None:
+            attributes["platform"] = platform
+        return self.request(
+            "POST",
+            "/reviewSubmissions",
+            json_body={
+                "data": {
+                    "type": "reviewSubmissions",
+                    "attributes": attributes,
+                    "relationships": {
+                        "app": {"data": {"type": "apps", "id": app_id}},
+                    },
+                }
+            },
+        )
+
+    def add_review_submission_item(
+        self,
+        review_submission_id: str,
+        *,
+        resource_type: str,
+        resource_id: str,
+    ) -> Mapping[str, Any]:
+        """Attach an App Store version, custom page version, or experiment to a review submission."""
+        relationship_name_by_type = {
+            "appStoreVersions": "appStoreVersion",
+            "appCustomProductPageVersions": "appCustomProductPageVersion",
+            "appStoreVersionExperiments": "appStoreVersionExperimentV2",
+        }
+        relationship_name = relationship_name_by_type.get(resource_type)
+        if relationship_name is None:
+            raise ValueError(f"Unsupported review submission resource_type: {resource_type}")
+        return self.request(
+            "POST",
+            "/reviewSubmissionItems",
+            json_body={
+                "data": {
+                    "type": "reviewSubmissionItems",
+                    "relationships": {
+                        "reviewSubmission": {
+                            "data": {"type": "reviewSubmissions", "id": review_submission_id}
+                        },
+                        relationship_name: {
+                            "data": {"type": resource_type, "id": resource_id}
+                        },
+                    },
+                }
+            },
+        )
+
+    def submit_review_submission(self, review_submission_id: str) -> Mapping[str, Any]:
+        """Submit a review submission to App Review."""
+        return self.request(
+            "PATCH",
+            f"/reviewSubmissions/{review_submission_id}",
+            json_body={
+                "data": {
+                    "type": "reviewSubmissions",
+                    "id": review_submission_id,
+                    "attributes": {"submitted": True},
                 }
             },
         )
@@ -1333,8 +2092,9 @@ def upload_screenshots(
     file_paths: Sequence[str | Path],
     *,
     replace: bool = True,
+    target_type: str = "appStoreVersionLocalizations",
 ) -> Dict[str, Any]:
-    """Upload screenshots for one version localization + display type.
+    """Upload screenshots for one localization + display type.
 
     Returns ``{"ok": True, "uploaded": int, "deleted": int}``.
     """
@@ -1344,7 +2104,10 @@ def upload_screenshots(
             raise FileNotFoundError(f"Screenshot file not found: {p}")
 
     # Find or create the screenshot set
-    existing_sets = client.list_app_screenshot_sets(version_localization_id)
+    existing_sets = client.list_app_screenshot_sets(
+        version_localization_id,
+        target_type=target_type,
+    )
     set_id: str | None = None
     for s in existing_sets:
         if s.get("attributes", {}).get("screenshotDisplayType") == display_type:
@@ -1352,7 +2115,11 @@ def upload_screenshots(
             break
 
     if set_id is None:
-        set_id = client.create_app_screenshot_set(version_localization_id, display_type)
+        set_id = client.create_app_screenshot_set(
+            version_localization_id,
+            display_type,
+            target_type=target_type,
+        )
 
     deleted = 0
     if replace:
@@ -1378,6 +2145,83 @@ def upload_screenshots(
             client.perform_upload_operation(op, chunk)
 
         client.complete_app_screenshot_upload(ss_id, md5_hash)
+        uploaded += 1
+
+    return {"ok": True, "uploaded": uploaded, "deleted": deleted}
+
+
+def upload_previews(
+    client: AppStoreConnectClient,
+    version_localization_id: str,
+    preview_type: str,
+    file_paths: Sequence[str | Path],
+    *,
+    replace: bool = True,
+    target_type: str = "appStoreVersionLocalizations",
+    mime_type: str | None = None,
+    preview_frame_time_code: str | None = None,
+) -> Dict[str, Any]:
+    """Upload app previews for one localization + preview type.
+
+    Returns ``{"ok": True, "uploaded": int, "deleted": int}``.
+    """
+    paths = [Path(p) for p in file_paths]
+    for p in paths:
+        if not p.exists():
+            raise FileNotFoundError(f"App preview file not found: {p}")
+
+    existing_sets = client.list_app_preview_sets(
+        version_localization_id,
+        target_type=target_type,
+    )
+    set_id: str | None = None
+    for preview_set in existing_sets:
+        if preview_set.get("attributes", {}).get("previewType") == preview_type:
+            set_id = preview_set["id"]
+            break
+
+    if set_id is None:
+        set_id = client.create_app_preview_set(
+            version_localization_id,
+            preview_type,
+            target_type=target_type,
+        )
+
+    deleted = 0
+    if replace:
+        existing = client.list_app_previews(set_id)
+        for preview in existing:
+            client.delete_app_preview(preview["id"])
+            deleted += 1
+
+    uploaded = 0
+    for file_path in paths:
+        file_bytes = file_path.read_bytes()
+        file_size = len(file_bytes)
+        md5_hash = hashlib.md5(file_bytes).hexdigest()
+        detected_mime_type = mime_type or mimetypes.guess_type(file_path.name)[0] or "video/mp4"
+
+        preview_data = client.create_app_preview(
+            set_id,
+            file_path.name,
+            file_size,
+            mime_type=detected_mime_type,
+            preview_frame_time_code=preview_frame_time_code,
+        )
+        preview_id = preview_data.get("id", "")
+        upload_ops = preview_data.get("attributes", {}).get("uploadOperations", [])
+
+        for op in upload_ops:
+            offset = op.get("offset", 0)
+            length = op.get("length", file_size)
+            chunk = file_bytes[offset:offset + length]
+            client.perform_upload_operation(op, chunk)
+
+        client.complete_app_preview_upload(
+            preview_id,
+            md5_hash,
+            preview_frame_time_code=preview_frame_time_code,
+        )
         uploaded += 1
 
     return {"ok": True, "uploaded": uploaded, "deleted": deleted}
@@ -1781,3 +2625,21 @@ def sync_subscription_pricing(
         "territories_set": total_territories,
         "missing_subscriptions": missing,
     }
+
+
+def parse_gzip_tabular_report(
+    content: bytes,
+    *,
+    delimiter: str = "\t",
+    max_rows: int | None = None,
+    encoding: str = "utf-8",
+) -> Dict[str, Any]:
+    """Decompress a gzip tabular report into rows plus the raw text."""
+    text = gzip.decompress(content).decode(encoding, errors="replace")
+    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+    rows: List[Dict[str, str]] = []
+    for idx, row in enumerate(reader):
+        if max_rows is not None and idx >= max_rows:
+            break
+        rows.append(dict(row))
+    return {"text": text, "rows": rows, "row_count": len(rows), "columns": reader.fieldnames or []}

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
+import io
 import os
+import zipfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,6 +20,9 @@ from perfectdeckcli.play_store import (
     apply_regional_pricing,
     apply_subscription_regional_pricing,
     create_service,
+    list_play_report_objects,
+    parse_play_report_content,
+    query_vitals_metric,
     ensure_managed_products,
     fetch_listings,
     fetch_products,
@@ -193,6 +199,71 @@ class TestCreateService:
         with patch.dict(os.environ, {"TEST_CREDS": str(bad_file)}, clear=False):
             with pytest.raises(ValueError, match="not valid JSON"):
                 create_service(credentials_path=None, env_var="TEST_CREDS")
+
+
+class TestReportingHelpers:
+    def test_query_vitals_metric_shape(self):
+        svc = MagicMock()
+        crashrate = svc.vitals.return_value.crashrate.return_value
+        crashrate.query.return_value.execute.return_value = {"rows": [{"metrics": []}]}
+
+        result = query_vitals_metric(
+            svc,
+            "com.example.app",
+            "crash_rate",
+            start_date="2026-04-20",
+            end_date="2026-04-22",
+            dimensions=["versionCode"],
+            metrics=["crashRate", "distinctUsers"],
+            filter_expr='versionCode = "42"',
+            page_size=500,
+        )
+
+        assert result["rows"] == [{"metrics": []}]
+        kwargs = crashrate.query.call_args.kwargs
+        assert kwargs["name"] == "apps/com.example.app/crashRateMetricSet"
+        body = kwargs["body"]
+        assert body["dimensions"] == ["versionCode"]
+        assert body["metrics"] == ["crashRate", "distinctUsers"]
+        assert body["timelineSpec"]["startTime"]["year"] == 2026
+        assert body["timelineSpec"]["endTime"]["day"] == 22
+        assert body["filter"] == 'versionCode = "42"'
+
+    def test_query_vitals_metric_rejects_unknown_metric_set(self):
+        with pytest.raises(ValueError, match="Unsupported metric_set"):
+            query_vitals_metric(
+                MagicMock(),
+                "com.example.app",
+                "not_real",
+                start_date="2026-04-20",
+                end_date="2026-04-21",
+            )
+
+    def test_list_play_report_objects(self):
+        session = MagicMock()
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"items": [{"name": "stats/installs/file.csv"}]}
+        session.get.return_value = response
+        result = list_play_report_objects(session, "pubsite_prod_rev_123", prefix="stats/installs/")
+        assert result["items"][0]["name"] == "stats/installs/file.csv"
+        assert session.get.call_args.kwargs["params"]["prefix"] == "stats/installs/"
+
+    def test_parse_play_report_content_utf16(self):
+        raw = "Date,Package Name,Daily Device Installs\n2026-04-20,com.example,7\n".encode("utf-16")
+        parsed = parse_play_report_content(raw)
+        assert parsed["columns"] == ["Date", "Package Name", "Daily Device Installs"]
+        assert parsed["rows"][0]["Daily Device Installs"] == "7"
+
+    def test_parse_play_report_content_gzip_and_zip(self):
+        raw_csv = b"Date,Value\n2026-04-20,1\n"
+        parsed_gzip = parse_play_report_content(gzip.compress(raw_csv), encoding="utf-8")
+        assert parsed_gzip["rows"][0]["Value"] == "1"
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as archive:
+            archive.writestr("report.csv", raw_csv)
+        parsed_zip = parse_play_report_content(buf.getvalue(), encoding="utf-8")
+        assert parsed_zip["rows"][0]["Date"] == "2026-04-20"
 
 
 # ======================================================================

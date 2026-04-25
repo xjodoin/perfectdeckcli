@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import threading
@@ -196,6 +197,48 @@ _TOOL_HINTS: dict[str, str] = {
     ),
     "perfectdeck_sync_play_subscription_pricing": (
         "Subscription pricing applied on Google Play."
+    ),
+    "perfectdeck_get_app_store_sales_report": (
+        "Sales and Trends reports are gzip TSV exports; daily reports may lag store UI availability."
+    ),
+    "perfectdeck_request_app_store_analytics_reports": (
+        "Apple usually takes 24-48 hours to generate the first ONGOING analytics reports."
+    ),
+    "perfectdeck_list_app_store_analytics_reports": (
+        "Choose a report id, then list instances by granularity and processing_date."
+    ),
+    "perfectdeck_list_app_store_analytics_instances": (
+        "Choose an instance id, then list/download its segments."
+    ),
+    "perfectdeck_download_app_store_analytics_segment": (
+        "Analytics segments are compressed tab-delimited files and may be privacy-thresholded."
+    ),
+    "perfectdeck_create_app_store_custom_product_page": (
+        "Custom product page created. Add a version, localizations, screenshots, then submit for review."
+    ),
+    "perfectdeck_create_app_store_custom_product_page_version": (
+        "Custom product page version created. Add localizations and assets before review submission."
+    ),
+    "perfectdeck_create_app_store_custom_product_page_localization": (
+        "Custom page localization created. Add screenshots or app previews before submitting."
+    ),
+    "perfectdeck_create_app_store_experiment": (
+        "Experiment created. Add treatments, treatment localizations, and assets before starting."
+    ),
+    "perfectdeck_create_app_store_experiment_treatment": (
+        "Treatment created. Add localizations and screenshots/app previews before review."
+    ),
+    "perfectdeck_create_app_store_review_submission": (
+        "Review submission created. Add items, then submit when ready."
+    ),
+    "perfectdeck_query_play_vitals": (
+        "For store visitors, installers, reviews, and financial data, use Play Console Cloud Storage report exports."
+    ),
+    "perfectdeck_list_play_report_files": (
+        "Use one object_name with perfectdeck_download_play_report_file to parse CSV rows."
+    ),
+    "perfectdeck_download_play_report_file": (
+        "Play Console CSV exports are often UTF-16 and monthly; watch for channel rows that can double-count totals."
     ),
     "perfectdeck_begin_transaction": (
         "All mutations are buffered until commit. "
@@ -950,6 +993,334 @@ class SyncPlaySubscriptionPricingInput(BaseModel):
         ...,
         description='Map of {region_code: {currency, price}}',
     )
+
+
+class AppStoreSalesReportInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
+    app: str = Field(..., min_length=1, description="App identifier for credential resolution.")
+    app_id: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+    key_id: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+    issuer_id: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+    private_key_path: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+    vendor_number: str = Field(..., min_length=1, description="Apple vendor number from Payments and Financial Reports.")
+    report_type: str = Field(default="SALES", description="SALES, SUBSCRIPTION, SUBSCRIBER, INSTALLS, etc.")
+    report_sub_type: str = Field(default="SUMMARY", description="SUMMARY, DETAILED, SUMMARY_TERRITORY, etc.")
+    frequency: str = Field(default="DAILY", description="DAILY, WEEKLY, MONTHLY, or YEARLY.")
+    report_date: str | None = Field(default=None, description="YYYY-MM-DD except daily sales reports can omit it.")
+    version: str | None = Field(default=None, description="Optional Apple report version, e.g. 1_0 or 1_3.")
+    max_rows: int = Field(default=100, ge=0, le=10000, description="Maximum parsed rows to return.")
+    include_text: bool = Field(default=False, description="Include decompressed TSV text in the response.")
+    include_base64: bool = Field(default=False, description="Include original gzip bytes as base64.")
+
+
+class AppStoreAnalyticsBaseInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
+    app: str = Field(..., min_length=1, description="App identifier for credential resolution.")
+    app_id: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+    key_id: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+    issuer_id: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+    private_key_path: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+
+
+class RequestAppStoreAnalyticsReportsInput(AppStoreAnalyticsBaseInput):
+    access_type: str = Field(default="ONGOING", description="ONGOING for daily/weekly/monthly future reports, or ONE_TIME_SNAPSHOT for historical snapshot.")
+
+
+class ListAppStoreAnalyticsRequestsInput(AppStoreAnalyticsBaseInput):
+    access_type: str | None = Field(default=None, description="Optional filter: ONGOING or ONE_TIME_SNAPSHOT.")
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class ListAppStoreAnalyticsReportsInput(AppStoreAnalyticsBaseInput):
+    request_id: str = Field(..., min_length=1, description="Analytics report request id.")
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class ListAppStoreAnalyticsInstancesInput(AppStoreAnalyticsBaseInput):
+    report_id: str = Field(..., min_length=1, description="Analytics report id.")
+    granularity: str | None = Field(default=None, description="DAILY, WEEKLY, or MONTHLY.")
+    processing_date: str | None = Field(default=None, description="YYYY-MM-DD processing date.")
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class ListAppStoreAnalyticsSegmentsInput(AppStoreAnalyticsBaseInput):
+    instance_id: str = Field(..., min_length=1, description="Analytics report instance id.")
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class DownloadAppStoreAnalyticsSegmentInput(AppStoreAnalyticsBaseInput):
+    segment_id: str = Field(..., min_length=1, description="Analytics report segment id.")
+    max_rows: int = Field(default=100, ge=0, le=10000, description="Maximum parsed rows to return.")
+    include_text: bool = Field(default=False, description="Include decompressed TSV text in the response.")
+    include_base64: bool = Field(default=False, description="Include original gzip bytes as base64.")
+
+
+class AppStoreCustomProductPageBaseInput(AppStoreAnalyticsBaseInput):
+    pass
+
+
+class ListAppStoreCustomProductPagesInput(AppStoreCustomProductPageBaseInput):
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class CreateAppStoreCustomProductPageInput(AppStoreCustomProductPageBaseInput):
+    name: str = Field(..., min_length=1, description="Internal reference name shown in App Store Connect analytics.")
+    app_store_version_template_id: str | None = Field(default=None, description="Optional appStoreVersion id to copy from.")
+    custom_product_page_template_id: str | None = Field(default=None, description="Optional custom product page id to copy from.")
+
+
+class UpdateAppStoreCustomProductPageInput(AppStoreCustomProductPageBaseInput):
+    page_id: str = Field(..., min_length=1)
+    name: str | None = Field(default=None)
+    visible: bool | None = Field(default=None, description="Whether the approved custom product page is visible.")
+
+
+class DeleteAppStoreCustomProductPageInput(AppStoreCustomProductPageBaseInput):
+    page_id: str = Field(..., min_length=1)
+
+
+class ListAppStoreKeywordsInput(AppStoreCustomProductPageBaseInput):
+    locale: str = Field(default="en-US", min_length=1)
+    platform: str = Field(default="IOS", min_length=1)
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class CustomProductPageIdInput(AppStoreCustomProductPageBaseInput):
+    page_id: str = Field(..., min_length=1)
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class CreateAppStoreCustomProductPageVersionInput(AppStoreCustomProductPageBaseInput):
+    page_id: str = Field(..., min_length=1)
+    deep_link: str | None = Field(default=None, description="Optional iOS 18+ deep link URL.")
+
+
+class UpdateAppStoreCustomProductPageVersionInput(AppStoreCustomProductPageBaseInput):
+    version_id: str = Field(..., min_length=1)
+    deep_link: str | None = Field(default=None, description="Optional iOS 18+ deep link URL.")
+
+
+class CustomProductPageVersionIdInput(AppStoreCustomProductPageBaseInput):
+    version_id: str = Field(..., min_length=1)
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class CreateAppStoreCustomProductPageLocalizationInput(AppStoreCustomProductPageBaseInput):
+    version_id: str = Field(..., min_length=1)
+    locale: str = Field(..., min_length=1)
+    promotional_text: str | None = Field(default=None)
+
+
+class UpdateAppStoreCustomProductPageLocalizationInput(AppStoreCustomProductPageBaseInput):
+    localization_id: str = Field(..., min_length=1)
+    promotional_text: str | None = Field(default=None)
+
+
+class LinkAppStoreCustomProductPageKeywordsInput(AppStoreCustomProductPageBaseInput):
+    localization_id: str = Field(..., min_length=1)
+    keyword_ids: list[str] = Field(..., min_length=1, description="App keyword resource ids to associate.")
+
+
+class UnlinkAppStoreCustomProductPageKeywordsInput(AppStoreCustomProductPageBaseInput):
+    localization_id: str = Field(..., min_length=1)
+    keyword_ids: list[str] = Field(..., min_length=1, description="App keyword resource ids to remove.")
+
+
+class UploadAppStoreCustomProductPageScreenshotsInput(AppStoreCustomProductPageBaseInput):
+    localization_id: str = Field(..., min_length=1, description="appCustomProductPageLocalization id.")
+    display_type: str = Field(..., min_length=1, description="e.g. APP_IPHONE_67, APP_IPAD_PRO_3GEN_129")
+    file_paths: list[str] = Field(..., min_length=1, description="Absolute paths to screenshot files")
+    replace: bool = Field(default=True)
+
+
+class UploadAppStoreCustomProductPagePreviewsInput(AppStoreCustomProductPageBaseInput):
+    localization_id: str = Field(..., min_length=1, description="appCustomProductPageLocalization id.")
+    preview_type: str = Field(..., min_length=1, description="e.g. IPHONE_67, IPAD_PRO_3GEN_129")
+    file_paths: list[str] = Field(..., min_length=1, description="Absolute paths to app preview video files")
+    replace: bool = Field(default=True)
+    mime_type: str | None = Field(default=None, description="Optional MIME type. Defaults from file extension, then video/mp4.")
+    preview_frame_time_code: str | None = Field(default=None, description="Optional poster frame timecode, e.g. 00:00:05:00.")
+
+
+class AppStoreExperimentBaseInput(AppStoreAnalyticsBaseInput):
+    pass
+
+
+class ListAppStoreExperimentsInput(AppStoreExperimentBaseInput):
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class CreateAppStoreExperimentInput(AppStoreExperimentBaseInput):
+    name: str = Field(..., min_length=1)
+    platform: str = Field(default="IOS", description="IOS, MAC_OS, TV_OS, or VISION_OS where supported.")
+    traffic_proportion: int = Field(default=50, ge=1, le=100, description="Percent of traffic included in the experiment.")
+
+
+class UpdateAppStoreExperimentInput(AppStoreExperimentBaseInput):
+    experiment_id: str = Field(..., min_length=1)
+    name: str | None = None
+    traffic_proportion: int | None = Field(default=None, ge=1, le=100)
+    started: bool | None = Field(default=None, description="Set true to start an approved experiment.")
+
+
+class DeleteAppStoreExperimentInput(AppStoreExperimentBaseInput):
+    experiment_id: str = Field(..., min_length=1)
+
+
+class AppStoreExperimentIdInput(AppStoreExperimentBaseInput):
+    experiment_id: str = Field(..., min_length=1)
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class CreateAppStoreExperimentTreatmentInput(AppStoreExperimentBaseInput):
+    experiment_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    app_icon_name: str | None = Field(default=None, description="Optional alternate app icon name bundled in the current binary.")
+
+
+class UpdateAppStoreExperimentTreatmentInput(AppStoreExperimentBaseInput):
+    treatment_id: str = Field(..., min_length=1)
+    name: str | None = None
+    app_icon_name: str | None = None
+
+
+class DeleteAppStoreExperimentTreatmentInput(AppStoreExperimentBaseInput):
+    treatment_id: str = Field(..., min_length=1)
+
+
+class AppStoreExperimentTreatmentIdInput(AppStoreExperimentBaseInput):
+    treatment_id: str = Field(..., min_length=1)
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class CreateAppStoreExperimentTreatmentLocalizationInput(AppStoreExperimentBaseInput):
+    treatment_id: str = Field(..., min_length=1)
+    locale: str = Field(..., min_length=1)
+
+
+class UploadAppStoreExperimentScreenshotsInput(AppStoreExperimentBaseInput):
+    localization_id: str = Field(..., min_length=1, description="appStoreVersionExperimentTreatmentLocalization id.")
+    display_type: str = Field(..., min_length=1)
+    file_paths: list[str] = Field(..., min_length=1)
+    replace: bool = Field(default=True)
+
+
+class UploadAppStoreExperimentPreviewsInput(AppStoreExperimentBaseInput):
+    localization_id: str = Field(..., min_length=1, description="appStoreVersionExperimentTreatmentLocalization id.")
+    preview_type: str = Field(..., min_length=1, description="e.g. IPHONE_67, IPAD_PRO_3GEN_129")
+    file_paths: list[str] = Field(..., min_length=1)
+    replace: bool = Field(default=True)
+    mime_type: str | None = None
+    preview_frame_time_code: str | None = None
+
+
+class CreateAppStoreReviewSubmissionInput(AppStoreAnalyticsBaseInput):
+    platform: str | None = Field(default=None, description="Optional platform, e.g. IOS.")
+
+
+class AddAppStoreReviewSubmissionItemInput(AppStoreAnalyticsBaseInput):
+    review_submission_id: str = Field(..., min_length=1)
+    resource_type: str = Field(
+        ...,
+        description="appStoreVersions, appCustomProductPageVersions, or appStoreVersionExperiments.",
+    )
+    resource_id: str = Field(..., min_length=1)
+
+
+class SubmitAppStoreReviewSubmissionInput(AppStoreAnalyticsBaseInput):
+    review_submission_id: str = Field(..., min_length=1)
+
+
+class PlayReportingAppsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    credentials_path: str | None = Field(default=None, description="Service account JSON path. Falls back to PLAY_SERVICE_ACCOUNT_JSON env var.")
+    page_size: int = Field(default=100, ge=1, le=1000)
+    page_token: str | None = None
+
+
+class PlayVitalsQueryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
+    app: str | None = Field(default=None, description="App identifier for credential resolution.")
+    package_name: str | None = Field(default=None, description="Android package name. Resolved from stored credentials if omitted.")
+    credentials_path: str | None = Field(default=None, description="Service account JSON path. Falls back to stored credentials or PLAY_SERVICE_ACCOUNT_JSON.")
+    metric_set: str = Field(
+        default="crash_rate",
+        description="One of: anr_rate, crash_rate, error_count, excessive_wakeup_rate, lmk_rate, slow_rendering_rate, slow_start_rate, stuck_background_wakelock_rate.",
+    )
+    start_date: str = Field(..., description="Inclusive start date YYYY-MM-DD.")
+    end_date: str = Field(..., description="Exclusive end date YYYY-MM-DD.")
+    dimensions: list[str] = Field(default_factory=list, description="Dimensions like versionCode, countryCode, deviceModel.")
+    metrics: list[str] = Field(default_factory=list, description="Metric names. Empty lets Google return defaults.")
+    aggregation_period: str = Field(default="DAILY", description="DAILY, HOURLY, or FULL_RANGE where supported.")
+    timezone_id: str = Field(default="America/Los_Angeles", description="DAILY uses America/Los_Angeles; HOURLY uses UTC.")
+    filter_expr: str | None = Field(default=None, description="AIP-160 filter expression over dimensions.")
+    user_cohort: str | None = Field(default=None, description="OS_PUBLIC, APP_TESTERS, or OS_BETA where supported.")
+    page_size: int = Field(default=1000, ge=1, le=100000)
+    page_token: str | None = None
+
+
+class PlayReportFilesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    credentials_path: str | None = Field(default=None, description="Service account JSON path. Falls back to PLAY_SERVICE_ACCOUNT_JSON env var.")
+    bucket: str = Field(..., min_length=1, description="Play report bucket id, e.g. pubsite_prod_rev_0123456789.")
+    prefix: str = Field(default="", description="Object prefix, e.g. stats/installs/ or reviews/.")
+    page_size: int = Field(default=1000, ge=1, le=1000)
+    page_token: str | None = None
+
+
+class DownloadPlayReportFileInput(PlayReportFilesInput):
+    object_name: str = Field(..., min_length=1, description="Full object path inside the Play report bucket.")
+    max_rows: int = Field(default=100, ge=0, le=10000)
+    encoding: str = Field(default="utf-16", description="Most Play Console CSV exports use UTF-16; fallback to UTF-8 is automatic.")
+    include_text: bool = Field(default=False, description="Include decoded CSV text in the response.")
+    include_base64: bool = Field(default=False, description="Include original object bytes as base64.")
+
+
+def _app_store_client_from_params(
+    project_path: str,
+    app: str,
+    app_id: str | None,
+    key_id: str | None,
+    issuer_id: str | None,
+    private_key_path: str | None,
+) -> tuple[str, app_store_api.AppStoreConnectClient]:
+    r_app_id, r_key_id, r_issuer_id, r_pk = _resolve_app_store_credentials(
+        project_path, app, app_id, key_id, issuer_id, private_key_path,
+    )
+    client = app_store_api.AppStoreConnectClient.from_key_file(
+        key_id=r_key_id,
+        issuer_id=r_issuer_id,
+        private_key_path=r_pk,
+    )
+    _persist_app_store_credentials(project_path, app, r_app_id, r_key_id, r_issuer_id, r_pk)
+    return r_app_id, client
+
+
+def _parsed_gzip_payload(
+    raw: bytes,
+    *,
+    max_rows: int,
+    include_text: bool,
+    include_base64: bool,
+) -> dict[str, Any]:
+    parsed = app_store_api.parse_gzip_tabular_report(raw, max_rows=max_rows)
+    if not include_text:
+        parsed.pop("text", None)
+    result: dict[str, Any] = {
+        "ok": True,
+        "columns": parsed["columns"],
+        "rows": parsed["rows"],
+        "row_count": parsed["row_count"],
+        "content_bytes": len(raw),
+    }
+    if include_text:
+        result["text"] = parsed["text"]
+    if include_base64:
+        result["content_base64"] = base64.b64encode(raw).decode("ascii")
+    return result
 
 
 @mcp.tool(
@@ -2254,7 +2625,6 @@ async def perfectdeck_batch_push_play_screenshots(
     # Bridge the sync on_progress callback (called from worker threads) to
     # the async ctx.report_progress, so the MCP client sees periodic
     # keepalives during long uploads.
-    loop = asyncio.get_running_loop()
     progress_state = {"done": 0, "total": 0, "message": ""}
     progress_lock = threading.Lock()
 
@@ -2488,6 +2858,590 @@ def perfectdeck_sync_play_subscription_pricing(params: SyncPlaySubscriptionPrici
     if params.app:
         _persist_play_credentials(params.project_path, params.app, pkg, creds)
     return _result(out, "perfectdeck_sync_play_subscription_pricing")
+
+
+# ======================================================================
+# Store analytics and reporting
+# ======================================================================
+
+
+@mcp.tool(
+    name="perfectdeck_get_app_store_sales_report",
+    annotations={
+        "title": "Get App Store Sales Report",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_get_app_store_sales_report(params: AppStoreSalesReportInput) -> str:
+    """Download and parse an App Store Connect Sales and Trends gzip TSV report.
+
+    Apple requires a Team API key and a vendor number. Common report_type/report_sub_type
+    combinations include SALES/SUMMARY and SUBSCRIPTION/SUMMARY.
+    """
+    _, client = _app_store_client_from_params(
+        params.project_path,
+        params.app,
+        params.app_id,
+        params.key_id,
+        params.issuer_id,
+        params.private_key_path,
+    )
+    raw = client.download_sales_report(
+        vendor_number=params.vendor_number,
+        report_type=params.report_type,
+        report_sub_type=params.report_sub_type,
+        frequency=params.frequency,
+        report_date=params.report_date,
+        version=params.version,
+    )
+    result = _parsed_gzip_payload(
+        raw,
+        max_rows=params.max_rows,
+        include_text=params.include_text,
+        include_base64=params.include_base64,
+    )
+    result.update({
+        "vendor_number": params.vendor_number,
+        "report_type": params.report_type,
+        "report_sub_type": params.report_sub_type,
+        "frequency": params.frequency,
+        "report_date": params.report_date,
+    })
+    return _result(result, "perfectdeck_get_app_store_sales_report")
+
+
+@mcp.tool(
+    name="perfectdeck_request_app_store_analytics_reports",
+    annotations={
+        "title": "Request App Store Analytics Reports",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_request_app_store_analytics_reports(params: RequestAppStoreAnalyticsReportsInput) -> str:
+    """Create an App Store Connect Analytics Reports request for an app."""
+    app_id, client = _app_store_client_from_params(
+        params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path,
+    )
+    out = client.request_analytics_reports(app_id, access_type=params.access_type)
+    return _result({"ok": True, "response": out}, "perfectdeck_request_app_store_analytics_reports")
+
+
+@mcp.tool(
+    name="perfectdeck_list_app_store_analytics_requests",
+    annotations={
+        "title": "List App Store Analytics Requests",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_list_app_store_analytics_requests(params: ListAppStoreAnalyticsRequestsInput) -> str:
+    """List App Store Connect Analytics Reports requests for an app."""
+    app_id, client = _app_store_client_from_params(
+        params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path,
+    )
+    out = client.list_analytics_report_requests(app_id, access_type=params.access_type, limit=params.limit)
+    return _result({"ok": True, "response": out}, "perfectdeck_list_app_store_analytics_reports")
+
+
+@mcp.tool(
+    name="perfectdeck_list_app_store_analytics_reports",
+    annotations={
+        "title": "List App Store Analytics Reports",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_list_app_store_analytics_reports(params: ListAppStoreAnalyticsReportsInput) -> str:
+    """List Analytics report definitions for one Analytics Reports request id."""
+    _, client = _app_store_client_from_params(
+        params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path,
+    )
+    out = client.list_analytics_reports(params.request_id, limit=params.limit)
+    return _result({"ok": True, "response": out}, "perfectdeck_list_app_store_analytics_reports")
+
+
+@mcp.tool(
+    name="perfectdeck_list_app_store_analytics_instances",
+    annotations={
+        "title": "List App Store Analytics Instances",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_list_app_store_analytics_instances(params: ListAppStoreAnalyticsInstancesInput) -> str:
+    """List downloadable Analytics report instances for a report id."""
+    _, client = _app_store_client_from_params(
+        params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path,
+    )
+    out = client.list_analytics_report_instances(
+        params.report_id,
+        granularity=params.granularity,
+        processing_date=params.processing_date,
+        limit=params.limit,
+    )
+    return _result({"ok": True, "response": out}, "perfectdeck_list_app_store_analytics_instances")
+
+
+@mcp.tool(
+    name="perfectdeck_list_app_store_analytics_segments",
+    annotations={
+        "title": "List App Store Analytics Segments",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_list_app_store_analytics_segments(params: ListAppStoreAnalyticsSegmentsInput) -> str:
+    """List downloadable segment metadata for one Analytics report instance."""
+    _, client = _app_store_client_from_params(
+        params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path,
+    )
+    out = client.list_analytics_report_segments(params.instance_id, limit=params.limit)
+    return _result({"ok": True, "response": out}, "perfectdeck_list_app_store_analytics_instances")
+
+
+@mcp.tool(
+    name="perfectdeck_download_app_store_analytics_segment",
+    annotations={
+        "title": "Download App Store Analytics Segment",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_download_app_store_analytics_segment(params: DownloadAppStoreAnalyticsSegmentInput) -> str:
+    """Download and parse one App Store Connect Analytics report segment."""
+    _, client = _app_store_client_from_params(
+        params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path,
+    )
+    raw = client.download_analytics_report_segment(params.segment_id)
+    result = _parsed_gzip_payload(
+        raw,
+        max_rows=params.max_rows,
+        include_text=params.include_text,
+        include_base64=params.include_base64,
+    )
+    result["segment_id"] = params.segment_id
+    return _result(result, "perfectdeck_download_app_store_analytics_segment")
+
+
+@mcp.tool(name="perfectdeck_list_app_store_custom_product_pages", annotations={"title": "List App Store Custom Product Pages", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_list_app_store_custom_product_pages(params: ListAppStoreCustomProductPagesInput) -> str:
+    """List App Store custom product pages for an app."""
+    app_id, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.list_custom_product_pages(app_id, limit=params.limit)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page")
+
+
+@mcp.tool(name="perfectdeck_create_app_store_custom_product_page", annotations={"title": "Create App Store Custom Product Page", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_create_app_store_custom_product_page(params: CreateAppStoreCustomProductPageInput) -> str:
+    """Create an App Store custom product page."""
+    app_id, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.create_custom_product_page(
+        app_id,
+        params.name,
+        app_store_version_template_id=params.app_store_version_template_id,
+        custom_product_page_template_id=params.custom_product_page_template_id,
+    )
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page")
+
+
+@mcp.tool(name="perfectdeck_update_app_store_custom_product_page", annotations={"title": "Update App Store Custom Product Page", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_update_app_store_custom_product_page(params: UpdateAppStoreCustomProductPageInput) -> str:
+    """Update a custom product page name or visibility."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.update_custom_product_page(params.page_id, name=params.name, visible=params.visible)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page")
+
+
+@mcp.tool(name="perfectdeck_delete_app_store_custom_product_page", annotations={"title": "Delete App Store Custom Product Page", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_delete_app_store_custom_product_page(params: DeleteAppStoreCustomProductPageInput) -> str:
+    """Delete an App Store custom product page."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.delete_custom_product_page(params.page_id)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page")
+
+
+@mcp.tool(name="perfectdeck_list_app_store_keywords", annotations={"title": "List App Store Keywords", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_list_app_store_keywords(params: ListAppStoreKeywordsInput) -> str:
+    """List app keyword resources that can be linked to custom product page localizations."""
+    app_id, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.list_app_keywords(app_id, locale=params.locale, platform=params.platform, limit=params.limit)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page_localization")
+
+
+@mcp.tool(name="perfectdeck_list_app_store_custom_product_page_versions", annotations={"title": "List App Store Custom Product Page Versions", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_list_app_store_custom_product_page_versions(params: CustomProductPageIdInput) -> str:
+    """List versions for a custom product page."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.list_custom_product_page_versions(params.page_id, limit=params.limit)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page_version")
+
+
+@mcp.tool(name="perfectdeck_create_app_store_custom_product_page_version", annotations={"title": "Create App Store Custom Product Page Version", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_create_app_store_custom_product_page_version(params: CreateAppStoreCustomProductPageVersionInput) -> str:
+    """Create a custom product page version."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.create_custom_product_page_version(params.page_id, deep_link=params.deep_link)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page_version")
+
+
+@mcp.tool(name="perfectdeck_update_app_store_custom_product_page_version", annotations={"title": "Update App Store Custom Product Page Version", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_update_app_store_custom_product_page_version(params: UpdateAppStoreCustomProductPageVersionInput) -> str:
+    """Update a custom product page version."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.update_custom_product_page_version(params.version_id, deep_link=params.deep_link)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page_version")
+
+
+@mcp.tool(name="perfectdeck_list_app_store_custom_product_page_localizations", annotations={"title": "List App Store Custom Product Page Localizations", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_list_app_store_custom_product_page_localizations(params: CustomProductPageVersionIdInput) -> str:
+    """List localizations for a custom product page version."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.list_custom_product_page_localizations(params.version_id, limit=params.limit)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page_localization")
+
+
+@mcp.tool(name="perfectdeck_create_app_store_custom_product_page_localization", annotations={"title": "Create App Store Custom Product Page Localization", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_create_app_store_custom_product_page_localization(params: CreateAppStoreCustomProductPageLocalizationInput) -> str:
+    """Create a custom product page localization."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.create_custom_product_page_localization(params.version_id, params.locale, promotional_text=params.promotional_text)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page_localization")
+
+
+@mcp.tool(name="perfectdeck_update_app_store_custom_product_page_localization", annotations={"title": "Update App Store Custom Product Page Localization", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_update_app_store_custom_product_page_localization(params: UpdateAppStoreCustomProductPageLocalizationInput) -> str:
+    """Update custom product page localization metadata."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.update_custom_product_page_localization(params.localization_id, promotional_text=params.promotional_text)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page_localization")
+
+
+@mcp.tool(name="perfectdeck_link_app_store_custom_product_page_keywords", annotations={"title": "Link App Store Custom Product Page Keywords", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_link_app_store_custom_product_page_keywords(params: LinkAppStoreCustomProductPageKeywordsInput) -> str:
+    """Associate existing App Store keyword resource IDs with a custom page localization."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.add_custom_product_page_search_keywords(params.localization_id, params.keyword_ids)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page_localization")
+
+
+@mcp.tool(name="perfectdeck_unlink_app_store_custom_product_page_keywords", annotations={"title": "Unlink App Store Custom Product Page Keywords", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_unlink_app_store_custom_product_page_keywords(params: UnlinkAppStoreCustomProductPageKeywordsInput) -> str:
+    """Remove App Store keyword associations from a custom page localization."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.remove_custom_product_page_search_keywords(params.localization_id, params.keyword_ids)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_custom_product_page_localization")
+
+
+@mcp.tool(name="perfectdeck_upload_app_store_custom_product_page_screenshots", annotations={"title": "Upload App Store Custom Product Page Screenshots", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_upload_app_store_custom_product_page_screenshots(params: UploadAppStoreCustomProductPageScreenshotsInput) -> str:
+    """Upload screenshots for one custom product page localization/display type."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = app_store_api.upload_screenshots(
+        client,
+        params.localization_id,
+        params.display_type,
+        params.file_paths,
+        replace=params.replace,
+        target_type="appCustomProductPageLocalizations",
+    )
+    return _result(out, "perfectdeck_create_app_store_custom_product_page_localization")
+
+
+@mcp.tool(name="perfectdeck_upload_app_store_custom_product_page_previews", annotations={"title": "Upload App Store Custom Product Page Previews", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_upload_app_store_custom_product_page_previews(params: UploadAppStoreCustomProductPagePreviewsInput) -> str:
+    """Upload app preview videos for one custom product page localization/preview type."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = app_store_api.upload_previews(
+        client,
+        params.localization_id,
+        params.preview_type,
+        params.file_paths,
+        replace=params.replace,
+        target_type="appCustomProductPageLocalizations",
+        mime_type=params.mime_type,
+        preview_frame_time_code=params.preview_frame_time_code,
+    )
+    return _result(out, "perfectdeck_create_app_store_custom_product_page_localization")
+
+
+@mcp.tool(name="perfectdeck_list_app_store_experiments", annotations={"title": "List App Store Experiments", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_list_app_store_experiments(params: ListAppStoreExperimentsInput) -> str:
+    """List App Store product page optimization experiments."""
+    app_id, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.list_app_store_experiments(app_id, limit=params.limit)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_experiment")
+
+
+@mcp.tool(name="perfectdeck_create_app_store_experiment", annotations={"title": "Create App Store Experiment", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_create_app_store_experiment(params: CreateAppStoreExperimentInput) -> str:
+    """Create an App Store product page optimization experiment."""
+    app_id, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.create_app_store_experiment(
+        app_id,
+        name=params.name,
+        platform=params.platform,
+        traffic_proportion=params.traffic_proportion,
+    )
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_experiment")
+
+
+@mcp.tool(name="perfectdeck_update_app_store_experiment", annotations={"title": "Update App Store Experiment", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_update_app_store_experiment(params: UpdateAppStoreExperimentInput) -> str:
+    """Update or start an App Store product page optimization experiment."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.update_app_store_experiment(
+        params.experiment_id,
+        name=params.name,
+        traffic_proportion=params.traffic_proportion,
+        started=params.started,
+    )
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_experiment")
+
+
+@mcp.tool(name="perfectdeck_delete_app_store_experiment", annotations={"title": "Delete App Store Experiment", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_delete_app_store_experiment(params: DeleteAppStoreExperimentInput) -> str:
+    """Delete an App Store product page optimization experiment before it starts."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.delete_app_store_experiment(params.experiment_id)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_experiment")
+
+
+@mcp.tool(name="perfectdeck_list_app_store_experiment_treatments", annotations={"title": "List App Store Experiment Treatments", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_list_app_store_experiment_treatments(params: AppStoreExperimentIdInput) -> str:
+    """List treatments for an App Store experiment."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.list_app_store_experiment_treatments(params.experiment_id, limit=params.limit)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_experiment_treatment")
+
+
+@mcp.tool(name="perfectdeck_create_app_store_experiment_treatment", annotations={"title": "Create App Store Experiment Treatment", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_create_app_store_experiment_treatment(params: CreateAppStoreExperimentTreatmentInput) -> str:
+    """Create a treatment for an App Store product page optimization experiment."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.create_app_store_experiment_treatment(params.experiment_id, name=params.name, app_icon_name=params.app_icon_name)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_experiment_treatment")
+
+
+@mcp.tool(name="perfectdeck_update_app_store_experiment_treatment", annotations={"title": "Update App Store Experiment Treatment", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_update_app_store_experiment_treatment(params: UpdateAppStoreExperimentTreatmentInput) -> str:
+    """Update an App Store experiment treatment."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.update_app_store_experiment_treatment(params.treatment_id, name=params.name, app_icon_name=params.app_icon_name)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_experiment_treatment")
+
+
+@mcp.tool(name="perfectdeck_delete_app_store_experiment_treatment", annotations={"title": "Delete App Store Experiment Treatment", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_delete_app_store_experiment_treatment(params: DeleteAppStoreExperimentTreatmentInput) -> str:
+    """Delete an App Store experiment treatment."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.delete_app_store_experiment_treatment(params.treatment_id)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_experiment_treatment")
+
+
+@mcp.tool(name="perfectdeck_list_app_store_experiment_treatment_localizations", annotations={"title": "List App Store Experiment Treatment Localizations", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+def perfectdeck_list_app_store_experiment_treatment_localizations(params: AppStoreExperimentTreatmentIdInput) -> str:
+    """List localizations for an App Store experiment treatment."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.list_app_store_experiment_treatment_localizations(params.treatment_id, limit=params.limit)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_experiment_treatment")
+
+
+@mcp.tool(name="perfectdeck_create_app_store_experiment_treatment_localization", annotations={"title": "Create App Store Experiment Treatment Localization", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_create_app_store_experiment_treatment_localization(params: CreateAppStoreExperimentTreatmentLocalizationInput) -> str:
+    """Create a localization for an App Store experiment treatment."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.create_app_store_experiment_treatment_localization(params.treatment_id, params.locale)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_experiment_treatment")
+
+
+@mcp.tool(name="perfectdeck_upload_app_store_experiment_screenshots", annotations={"title": "Upload App Store Experiment Screenshots", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_upload_app_store_experiment_screenshots(params: UploadAppStoreExperimentScreenshotsInput) -> str:
+    """Upload screenshots for one experiment treatment localization/display type."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = app_store_api.upload_screenshots(
+        client,
+        params.localization_id,
+        params.display_type,
+        params.file_paths,
+        replace=params.replace,
+        target_type="appStoreVersionExperimentTreatmentLocalizations",
+    )
+    return _result(out, "perfectdeck_create_app_store_experiment_treatment")
+
+
+@mcp.tool(name="perfectdeck_upload_app_store_experiment_previews", annotations={"title": "Upload App Store Experiment Previews", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_upload_app_store_experiment_previews(params: UploadAppStoreExperimentPreviewsInput) -> str:
+    """Upload app preview videos for one experiment treatment localization/preview type."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = app_store_api.upload_previews(
+        client,
+        params.localization_id,
+        params.preview_type,
+        params.file_paths,
+        replace=params.replace,
+        target_type="appStoreVersionExperimentTreatmentLocalizations",
+        mime_type=params.mime_type,
+        preview_frame_time_code=params.preview_frame_time_code,
+    )
+    return _result(out, "perfectdeck_create_app_store_experiment_treatment")
+
+
+@mcp.tool(name="perfectdeck_create_app_store_review_submission", annotations={"title": "Create App Store Review Submission", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_create_app_store_review_submission(params: CreateAppStoreReviewSubmissionInput) -> str:
+    """Create a review submission container for app metadata, custom pages, or experiments."""
+    app_id, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.create_review_submission(app_id, platform=params.platform)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_review_submission")
+
+
+@mcp.tool(name="perfectdeck_add_app_store_review_submission_item", annotations={"title": "Add App Store Review Submission Item", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_add_app_store_review_submission_item(params: AddAppStoreReviewSubmissionItemInput) -> str:
+    """Add a custom page version, experiment, or app version to a review submission."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.add_review_submission_item(
+        params.review_submission_id,
+        resource_type=params.resource_type,
+        resource_id=params.resource_id,
+    )
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_review_submission")
+
+
+@mcp.tool(name="perfectdeck_submit_app_store_review_submission", annotations={"title": "Submit App Store Review Submission", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def perfectdeck_submit_app_store_review_submission(params: SubmitAppStoreReviewSubmissionInput) -> str:
+    """Submit a prepared App Store review submission."""
+    _, client = _app_store_client_from_params(params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path)
+    out = client.submit_review_submission(params.review_submission_id)
+    return _result({"ok": True, "response": out}, "perfectdeck_create_app_store_review_submission")
+
+
+@mcp.tool(
+    name="perfectdeck_list_play_reporting_apps",
+    annotations={
+        "title": "List Play Reporting Apps",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_list_play_reporting_apps(params: PlayReportingAppsInput) -> str:
+    """List apps visible to the Play Developer Reporting API service account."""
+    api = play_store_api.create_reporting_service(credentials_path=params.credentials_path)
+    out = play_store_api.search_reporting_apps(api, page_size=params.page_size, page_token=params.page_token)
+    return _result({"ok": True, "response": out}, "perfectdeck_query_play_vitals")
+
+
+@mcp.tool(
+    name="perfectdeck_query_play_vitals",
+    annotations={
+        "title": "Query Play Vitals",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_query_play_vitals(params: PlayVitalsQueryInput) -> str:
+    """Query Android vitals via the Google Play Developer Reporting API."""
+    if params.app:
+        pkg, creds = _resolve_play_credentials(params.project_path, params.app, params.package_name, params.credentials_path)
+    else:
+        if not params.package_name:
+            raise ValueError("package_name is required when app is not set for credential resolution.")
+        pkg, creds = params.package_name, params.credentials_path
+    api = play_store_api.create_reporting_service(credentials_path=creds)
+    out = play_store_api.query_vitals_metric(
+        api,
+        pkg,
+        params.metric_set,
+        start_date=params.start_date,
+        end_date=params.end_date,
+        dimensions=params.dimensions,
+        metrics=params.metrics,
+        aggregation_period=params.aggregation_period,
+        timezone_id=params.timezone_id,
+        filter_expr=params.filter_expr,
+        user_cohort=params.user_cohort,
+        page_size=params.page_size,
+        page_token=params.page_token,
+    )
+    if params.app:
+        _persist_play_credentials(params.project_path, params.app, pkg, creds)
+    return _result({"ok": True, "package_name": pkg, "metric_set": params.metric_set, "response": out}, "perfectdeck_query_play_vitals")
+
+
+@mcp.tool(
+    name="perfectdeck_list_play_report_files",
+    annotations={
+        "title": "List Play Report Files",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_list_play_report_files(params: PlayReportFilesInput) -> str:
+    """List Play Console monthly report CSV files stored in the developer Cloud Storage bucket."""
+    session = play_store_api.create_storage_session(credentials_path=params.credentials_path)
+    out = play_store_api.list_play_report_objects(
+        session,
+        params.bucket,
+        prefix=params.prefix,
+        page_size=params.page_size,
+        page_token=params.page_token,
+    )
+    return _result({"ok": True, "bucket": params.bucket, "prefix": params.prefix, "response": out}, "perfectdeck_list_play_report_files")
+
+
+@mcp.tool(
+    name="perfectdeck_download_play_report_file",
+    annotations={
+        "title": "Download Play Report File",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_download_play_report_file(params: DownloadPlayReportFileInput) -> str:
+    """Download and parse one Play Console Cloud Storage report object."""
+    session = play_store_api.create_storage_session(credentials_path=params.credentials_path)
+    raw = play_store_api.download_play_report_object(session, params.bucket, params.object_name)
+    parsed = play_store_api.parse_play_report_content(
+        raw,
+        max_rows=params.max_rows,
+        encoding=params.encoding,
+    )
+    result: dict[str, Any] = {
+        "ok": True,
+        "bucket": params.bucket,
+        "object_name": params.object_name,
+        "columns": parsed["columns"],
+        "rows": parsed["rows"],
+        "row_count": parsed["row_count"],
+        "content_bytes": len(raw),
+    }
+    if params.include_text:
+        result["text"] = parsed["text"]
+    if params.include_base64:
+        result["content_base64"] = base64.b64encode(raw).decode("ascii")
+    return _result(result, "perfectdeck_download_play_report_file")
 
 
 # ======================================================================
