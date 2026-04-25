@@ -8,6 +8,7 @@ from typing import Any, Sequence, cast
 
 from . import app_store as app_store_api
 from . import play_store as play_store_api
+from . import store_api_coverage
 from .models import StoreName
 from .service import ListingService
 from .storage import FileStorageBackend
@@ -21,6 +22,22 @@ def _json_or_string(raw: str, parse_json: bool) -> Any:
 
 def _csv(raw: str | None) -> list[str]:
     return [part.strip() for part in (raw or "").split(",") if part.strip()]
+
+
+def _json_object(raw: str | None, *, option: str) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{option} must be a JSON object.")
+    return parsed
+
+
+def _require_write_confirmation(method: str, yes: bool, *, command: str) -> None:
+    if method.upper() in {"GET", "HEAD", "OPTIONS"}:
+        return
+    if not yes:
+        raise ValueError(f"{command} with method {method.upper()} can mutate store state; pass --yes to confirm.")
 
 
 def _resolve_app_store_cli_credentials(
@@ -289,6 +306,28 @@ def build_parser() -> argparse.ArgumentParser:
     play_download_parser.add_argument("--encoding", default="utf-16")
     play_download_parser.add_argument("--include-text", action="store_true")
     play_download_parser.add_argument("--include-base64", action="store_true")
+
+    coverage_parser = subparsers.add_parser("store-api-coverage", help="Show official store API coverage status.")
+    coverage_parser.add_argument("--provider", choices=["app_store", "play_android_publisher", "play_reporting", "play_reports"])
+    coverage_parser.add_argument("--no-rows", action="store_true", help="Return only summary and operation metadata.")
+    coverage_parser.add_argument("--markdown", action="store_true", help="Include rendered Markdown coverage matrix.")
+
+    app_store_request_parser = subparsers.add_parser("app-store-api-request", help="Call a generic App Store Connect API endpoint.")
+    app_store_request_parser.add_argument("--app", required=True)
+    _add_app_store_auth_args(app_store_request_parser)
+    app_store_request_parser.add_argument("--method", default="GET")
+    app_store_request_parser.add_argument("--path", required=True, help="API path such as /v1/apps or /v2/appStoreVersionExperiments.")
+    app_store_request_parser.add_argument("--params", help="JSON object of query parameters.")
+    app_store_request_parser.add_argument("--body", help="JSON object request body.")
+    app_store_request_parser.add_argument("--yes", action="store_true", help="Confirm non-read generic API request.")
+
+    play_request_parser = subparsers.add_parser("play-api-request", help="Call a generic Android Publisher API endpoint.")
+    _add_play_auth_args(play_request_parser)
+    play_request_parser.add_argument("--method", default="GET")
+    play_request_parser.add_argument("--path", required=True, help="Path under /androidpublisher/v3, or a full URL.")
+    play_request_parser.add_argument("--params", help="JSON object of query parameters.")
+    play_request_parser.add_argument("--body", help="JSON object request body.")
+    play_request_parser.add_argument("--yes", action="store_true", help="Confirm non-read generic API request.")
 
     cpp_list_parser = subparsers.add_parser("app-store-custom-pages", help="List App Store custom product pages.")
     cpp_list_parser.add_argument("--app", required=True)
@@ -678,6 +717,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             result["text"] = parsed["text"]
         if args.include_base64:
             result["content_base64"] = base64.b64encode(content).decode("ascii")
+    elif args.command == "store-api-coverage":
+        result = store_api_coverage.coverage_payload(args.provider, include_rows=not args.no_rows)
+        if args.markdown:
+            result["markdown"] = store_api_coverage.render_coverage_markdown(args.provider)
+    elif args.command == "app-store-api-request":
+        _require_write_confirmation(args.method, args.yes, command=args.command)
+        _, client = _app_store_client_from_cli(service, args)
+        result = client.request(
+            args.method,
+            args.path,
+            params=_json_object(args.params, option="--params"),
+            json_body=_json_object(args.body, option="--body"),
+        )
+    elif args.command == "play-api-request":
+        _require_write_confirmation(args.method, args.yes, command=args.command)
+        package_name = args.package_name or ""
+        credentials_path = args.credentials_path
+        if args.app:
+            stored = service.get_credentials(args.app, "play")
+            package_name = package_name or str(stored.get("package_name") or "")
+            credentials_path = credentials_path if credentials_path is not None else stored.get("credentials_path")
+        session = play_store_api.create_android_publisher_session(credentials_path=credentials_path)
+        result = play_store_api.android_publisher_request(
+            session,
+            args.method,
+            args.path,
+            params=_json_object(args.params, option="--params"),
+            json_body=_json_object(args.body, option="--body"),
+        )
+        if args.app:
+            credential_payload = {
+                **({"package_name": package_name} if package_name else {}),
+                **({"credentials_path": credentials_path} if credentials_path else {}),
+            }
+            if credential_payload:
+                service.save_credentials(args.app, "play", credential_payload)
     elif args.command == "app-store-custom-pages":
         app_id, client = _app_store_client_from_cli(service, args)
         result = client.list_custom_product_pages(app_id, limit=args.limit)

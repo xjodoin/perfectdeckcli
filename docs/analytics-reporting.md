@@ -16,6 +16,11 @@ The stores expose analytics through different systems:
 - Google Play statistics, reviews, acquisition, and financial exports are CSV
   files in the Play Console Cloud Storage reporting bucket.
 
+For full official API coverage, run `store-api-coverage` or read
+`docs/store-api-coverage.md`. Categories marked `generic-supported` are
+reachable with the generic official API request tools even when a typed workflow
+does not exist yet.
+
 ## Google Play Vitals
 
 Use `play-vitals` to query Android vitals metric sets:

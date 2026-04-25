@@ -16,6 +16,7 @@ from .project_router import ProjectListingRouter
 from .service import diff_objects
 from . import play_store as play_store_api
 from . import app_store as app_store_api
+from . import store_api_coverage
 from . import regional_pricing
 
 logger = logging.getLogger(__name__)
@@ -240,6 +241,15 @@ _TOOL_HINTS: dict[str, str] = {
     "perfectdeck_download_play_report_file": (
         "Play Console CSV exports are often UTF-16 and monthly; watch for channel rows that can double-count totals."
     ),
+    "perfectdeck_store_api_coverage": (
+        "Use generic API request tools for generic-supported categories and typed tools for typed-supported categories."
+    ),
+    "perfectdeck_app_store_api_request": (
+        "Prefer typed tools when available. Non-read methods require confirm_destructive=true."
+    ),
+    "perfectdeck_play_api_request": (
+        "Prefer typed tools when available. Non-read methods require confirm_destructive=true."
+    ),
     "perfectdeck_begin_transaction": (
         "All mutations are buffered until commit. "
         "Use perfectdeck_commit_transaction to persist or perfectdeck_rollback_transaction to discard."
@@ -265,6 +275,13 @@ def _router() -> ProjectListingRouter:
     if router is None:
         raise RuntimeError("Server not initialized. Start with perfectdeck-mcp --root-folder <path>.")
     return router
+
+
+def _require_api_confirmation(method: str, confirmed: bool) -> None:
+    if method.upper() in {"GET", "HEAD", "OPTIONS"}:
+        return
+    if not confirmed:
+        raise ValueError(f"Generic {method.upper()} API requests can mutate store state; set confirm_destructive=true.")
 
 
 # ======================================================================
@@ -1231,6 +1248,34 @@ class AddAppStoreReviewSubmissionItemInput(AppStoreAnalyticsBaseInput):
 
 class SubmitAppStoreReviewSubmissionInput(AppStoreAnalyticsBaseInput):
     review_submission_id: str = Field(..., min_length=1)
+
+
+class StoreApiCoverageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    provider: str | None = Field(default=None, description="Optional provider filter: app_store, play_android_publisher, play_reporting, play_reports.")
+    include_rows: bool = Field(default=True)
+    include_markdown: bool = Field(default=False)
+
+
+class AppStoreApiRequestInput(AppStoreAnalyticsBaseInput):
+    method: str = Field(default="GET", description="HTTP method.")
+    path: str = Field(..., min_length=1, description="App Store Connect API path such as /v1/apps.")
+    params: dict[str, str] | None = Field(default=None, description="Query parameters.")
+    body: dict[str, Any] | None = Field(default=None, description="JSON request body.")
+    confirm_destructive: bool = Field(default=False, description="Required for non-read methods.")
+
+
+class PlayApiRequestInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
+    app: str | None = Field(default=None, description="Local app id for stored credential resolution.")
+    package_name: str | None = Field(default=None, description="Android package name for stored credential resolution.")
+    credentials_path: str | None = Field(default=None, description="Service account JSON path. Falls back to stored credentials or PLAY_SERVICE_ACCOUNT_JSON.")
+    method: str = Field(default="GET", description="HTTP method.")
+    path: str = Field(..., min_length=1, description="Path under /androidpublisher/v3, or a full URL.")
+    params: dict[str, str] | None = None
+    body: dict[str, Any] | None = None
+    confirm_destructive: bool = Field(default=False, description="Required for non-read methods.")
 
 
 class PlayReportingAppsInput(BaseModel):
@@ -2863,6 +2908,81 @@ def perfectdeck_sync_play_subscription_pricing(params: SyncPlaySubscriptionPrici
 # ======================================================================
 # Store analytics and reporting
 # ======================================================================
+
+
+@mcp.tool(
+    name="perfectdeck_store_api_coverage",
+    annotations={
+        "title": "Store API Coverage",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def perfectdeck_store_api_coverage(params: StoreApiCoverageInput) -> str:
+    """Return the official public store API coverage matrix."""
+    out = store_api_coverage.coverage_payload(params.provider, include_rows=params.include_rows)
+    if params.include_markdown:
+        out["markdown"] = store_api_coverage.render_coverage_markdown(params.provider)
+    return _result(out, "perfectdeck_store_api_coverage")
+
+
+@mcp.tool(
+    name="perfectdeck_app_store_api_request",
+    annotations={
+        "title": "Generic App Store Connect API Request",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_app_store_api_request(params: AppStoreApiRequestInput) -> str:
+    """Call an arbitrary official App Store Connect API endpoint."""
+    _require_api_confirmation(params.method, params.confirm_destructive)
+    _, client = _app_store_client_from_params(
+        params.project_path, params.app, params.app_id, params.key_id, params.issuer_id, params.private_key_path,
+    )
+    out = client.request(params.method, params.path, params=params.params, json_body=params.body)
+    return _result({"ok": True, "response": out}, "perfectdeck_app_store_api_request")
+
+
+@mcp.tool(
+    name="perfectdeck_play_api_request",
+    annotations={
+        "title": "Generic Android Publisher API Request",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_play_api_request(params: PlayApiRequestInput) -> str:
+    """Call an arbitrary official Android Publisher API endpoint."""
+    _require_api_confirmation(params.method, params.confirm_destructive)
+    pkg = params.package_name or ""
+    creds = params.credentials_path
+    if params.app:
+        stored = _router().service_for(params.project_path).get_credentials(params.app, "play")
+        pkg = pkg or str(stored.get("package_name") or "")
+        creds = creds if creds is not None else stored.get("credentials_path")
+    session = play_store_api.create_android_publisher_session(credentials_path=creds)
+    out = play_store_api.android_publisher_request(
+        session,
+        params.method,
+        params.path,
+        params=params.params,
+        json_body=params.body,
+    )
+    if params.app:
+        payload = {
+            **({"package_name": pkg} if pkg else {}),
+            **({"credentials_path": creds} if creds else {}),
+        }
+        if payload:
+            _router().service_for(params.project_path).save_credentials(params.app, "play", payload)
+    return _result({"ok": True, "response": out}, "perfectdeck_play_api_request")
 
 
 @mcp.tool(

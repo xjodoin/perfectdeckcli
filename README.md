@@ -16,6 +16,7 @@ Related docs:
 - MCP client setup: `docs/mcp-client-setup.md`
 - Authentication and credential storage: `docs/authentication.md`
 - Store analytics and reporting: `docs/analytics-reporting.md`
+- Official API coverage matrix: `docs/store-api-coverage.md`
 - Regional pricing policy: `docs/pricing-policy.md`
 
 ## Installation
@@ -141,6 +142,11 @@ perfectdeckcli --file ../myapp/listings.yaml play-vitals \
 
 See `docs/analytics-reporting.md` for API setup, permissions, MCP tool names,
 and troubleshooting.
+
+Use `store-api-coverage` to inspect the current official API coverage matrix.
+Categories marked `typed-supported` have first-class workflows. Categories
+marked `generic-supported` are reachable through `app-store-api-request` or
+`play-api-request` while typed workflows are added.
 
 ## App Store Conversion Experiments
 

@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Sequence
 from urllib.parse import quote
+from urllib.parse import urlencode
 
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.service_account import Credentials
@@ -259,6 +260,49 @@ def create_storage_session(
         ["https://www.googleapis.com/auth/devstorage.read_only"],
     )
     return AuthorizedSession(credentials)
+
+
+def create_android_publisher_session(
+    credentials_path: str | None = None,
+    env_var: str = "PLAY_SERVICE_ACCOUNT_JSON",
+) -> AuthorizedSession:
+    """Create an authorized REST session for Android Publisher API passthrough calls."""
+    credentials = _load_service_account_credentials(
+        credentials_path,
+        env_var,
+        ["https://www.googleapis.com/auth/androidpublisher"],
+    )
+    return AuthorizedSession(credentials)
+
+
+def android_publisher_request(
+    session: AuthorizedSession,
+    method: str,
+    path: str,
+    *,
+    params: Mapping[str, str] | None = None,
+    json_body: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    """Call an arbitrary official Android Publisher v3 REST endpoint."""
+    if path.startswith("http://") or path.startswith("https://"):
+        url = path
+    else:
+        normalized = path if path.startswith("/") else f"/{path}"
+        if normalized.startswith("/androidpublisher/"):
+            url = f"https://androidpublisher.googleapis.com{normalized}"
+        else:
+            url = f"https://androidpublisher.googleapis.com/androidpublisher/v3{normalized}"
+    if params:
+        url = f"{url}?{urlencode(params)}"
+    response = session.request(method.upper(), url, json=json_body, timeout=60)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Android Publisher API error {response.status_code}: {response.text}")
+    if response.status_code == 204 or not response.content:
+        return {}
+    content_type = response.headers.get("content-type", "")
+    if "json" not in content_type:
+        return {"text": response.text}
+    return response.json()
 
 
 VITALS_METRIC_SETS: Mapping[str, tuple[str, str]] = {

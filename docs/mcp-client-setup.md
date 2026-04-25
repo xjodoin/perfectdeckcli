@@ -119,6 +119,9 @@ App Store Connect:
 - `perfectdeck_list_app_store_analytics_instances`
 - `perfectdeck_list_app_store_analytics_segments`
 - `perfectdeck_download_app_store_analytics_segment`
+- `perfectdeck_store_api_coverage`
+- `perfectdeck_app_store_api_request`
+- `perfectdeck_play_api_request`
 - `perfectdeck_list_app_store_custom_product_pages`
 - `perfectdeck_create_app_store_custom_product_page`
 - `perfectdeck_update_app_store_custom_product_page`

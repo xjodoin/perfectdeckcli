@@ -91,6 +91,13 @@ omitted. Explicit values still take precedence over stored credentials.
 This means you can configure credentials once per app and store, then reuse the
 same project in repeated MCP sessions.
 
+Generic official API request tools (`app-store-api-request`,
+`play-api-request`, `perfectdeck_app_store_api_request`, and
+`perfectdeck_play_api_request`) use the same credentials as typed operations.
+Non-read generic requests require explicit confirmation (`--yes` for CLI or
+`confirm_destructive=true` for MCP) because endpoint-specific side effects
+cannot be inferred safely.
+
 ## Operational guidance
 
 - Use absolute paths for credential files when possible.
