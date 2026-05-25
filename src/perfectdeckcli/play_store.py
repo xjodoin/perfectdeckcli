@@ -1592,3 +1592,144 @@ def apply_subscription_regional_pricing(
         )
     )
     return {"ok": True, "subscription_id": subscription_id, "regions_applied": len(regional_prices)}
+
+
+def create_subscription(
+    service: Any,
+    package_name: str,
+    subscription_id: str,
+    *,
+    base_plan_id: str,
+    billing_period: str,
+    listings: Mapping[str, Mapping[str, Any]],
+    regional_prices: Mapping[str, Mapping[str, Any]] | None = None,
+    grace_period: str | None = None,
+    resubscribe_state: str = "RESUBSCRIBE_STATE_ACTIVE",
+    proration_mode: str = (
+        "SUBSCRIPTION_PRORATION_MODE_CHARGE_ON_NEXT_BILLING_DATE"
+    ),
+    activate: bool = True,
+    regions_version: str = "2025/03",
+) -> Dict[str, Any]:
+    """Create an auto-renewing subscription with a single base plan, then
+    activate it so it's sellable.
+
+    This is the Google Play counterpart to creating an auto-renewable
+    subscription: ``monetization.subscriptions.create`` makes the subscription
+    with its base plan in DRAFT state, and ``basePlans.activate`` publishes it.
+
+    Args:
+        subscription_id: the product id, e.g. ``...premium_annual``.
+        base_plan_id: RFC-1034 base-plan id, e.g. ``annual``.
+        billing_period: ISO-8601 duration, e.g. ``P1Y`` (annual) or ``P1M``.
+        listings: ``{languageCode: {title, description?, benefits?}}`` (title
+            required by Play; benefits capped at 4).
+        regional_prices: ``{regionCode: {currency, price}}`` set on the base
+            plan's ``regionalConfigs`` (newSubscriberAvailability=True).
+
+    Idempotent: if the subscription already exists it is left as-is (only the
+    activate step runs); use ``apply_subscription_regional_pricing`` to update
+    pricing on an existing base plan.
+
+    Returns ``{"ok", "subscription_id", "base_plan_id", "created", "activated",
+    "regions_set"}``.
+    """
+    monetization = service.monetization()
+
+    existing: Dict[str, Any] | None
+    try:
+        existing = _execute_with_retry(
+            monetization.subscriptions().get(
+                packageName=package_name, productId=subscription_id,
+            )
+        )
+    except Exception:
+        existing = None
+
+    created = False
+    if existing is None:
+        listing_entries: List[Dict[str, Any]] = []
+        for language_code, fields in listings.items():
+            entry: Dict[str, Any] = {"languageCode": language_code}
+            if fields.get("title"):
+                entry["title"] = fields["title"]
+            if fields.get("description"):
+                entry["description"] = fields["description"]
+            benefits = fields.get("benefits")
+            if benefits:
+                entry["benefits"] = list(benefits)[:4]
+            if "title" in entry:
+                listing_entries.append(entry)
+        if not listing_entries:
+            raise ValueError(
+                "Play subscription create requires at least one listing with a title."
+            )
+
+        auto_renewing: Dict[str, Any] = {
+            "billingPeriodDuration": billing_period,
+            "resubscribeState": resubscribe_state,
+            "prorationMode": proration_mode,
+            "legacyCompatible": False,
+        }
+        if grace_period:
+            auto_renewing["gracePeriodDuration"] = grace_period
+
+        regional_configs = [
+            {
+                "regionCode": region,
+                "newSubscriberAvailability": True,
+                "price": _price_to_money_proto(
+                    info.get("currency", "USD"), info.get("price", 0),
+                ),
+            }
+            for region, info in (regional_prices or {}).items()
+        ]
+
+        body: Dict[str, Any] = {
+            "productId": subscription_id,
+            "packageName": package_name,
+            "listings": listing_entries,
+            "basePlans": [
+                {
+                    "basePlanId": base_plan_id,
+                    "autoRenewingBasePlanType": auto_renewing,
+                    "regionalConfigs": regional_configs,
+                }
+            ],
+        }
+
+        _execute_with_retry(
+            monetization.subscriptions().create(
+                packageName=package_name,
+                productId=subscription_id,
+                regionsVersion_version=regions_version,
+                body=body,
+            )
+        )
+        created = True
+
+    activated = False
+    if activate:
+        try:
+            _execute_with_retry(
+                monetization.subscriptions().basePlans().activate(
+                    packageName=package_name,
+                    productId=subscription_id,
+                    basePlanId=base_plan_id,
+                    body={},
+                )
+            )
+            activated = True
+        except Exception:
+            # Already active, or activation not permitted yet — non-fatal; the
+            # base plan can be activated from Play Console.
+            activated = False
+
+    return {
+        "ok": True,
+        "subscription_id": subscription_id,
+        "base_plan_id": base_plan_id,
+        "created": created,
+        "activated": activated,
+        "regions_set": len(regional_prices or {}),
+    }

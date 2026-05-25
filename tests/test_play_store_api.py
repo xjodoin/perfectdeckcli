@@ -20,6 +20,7 @@ from perfectdeckcli.play_store import (
     apply_regional_pricing,
     apply_subscription_regional_pricing,
     create_service,
+    create_subscription,
     list_play_report_objects,
     parse_play_report_content,
     query_vitals_metric,
@@ -1143,6 +1144,71 @@ class TestApplySubscriptionRegionalPricing:
             {"US": {"currency": "USD", "price": 9.99}},
         )
         assert result["ok"] is True
+
+
+# ======================================================================
+# create_subscription
+# ======================================================================
+
+
+class TestCreateSubscription:
+    def test_creates_and_activates(self):
+        svc = _mock_service()
+        monetization = svc.monetization.return_value
+        # Subscription does not exist yet -> get raises -> triggers create.
+        monetization.subscriptions.return_value.get.return_value.execute.side_effect = Exception("404")
+        result = create_subscription(
+            svc, "com.example.app", "me.example.premium_annual",
+            base_plan_id="annual",
+            billing_period="P1Y",
+            listings={"en-US": {"title": "Premium Annual"}},
+            regional_prices={
+                "US": {"currency": "USD", "price": 57.99},
+                "GB": {"currency": "GBP", "price": 42.99},
+            },
+        )
+        assert result["created"] is True
+        assert result["activated"] is True
+        assert result["regions_set"] == 2
+
+        create_kwargs = monetization.subscriptions.return_value.create.call_args.kwargs
+        assert create_kwargs["regionsVersion_version"] == "2025/03"
+        base_plan = create_kwargs["body"]["basePlans"][0]
+        assert base_plan["basePlanId"] == "annual"
+        assert base_plan["autoRenewingBasePlanType"]["billingPeriodDuration"] == "P1Y"
+        # Money proto conversion for $57.99
+        us = next(c for c in base_plan["regionalConfigs"] if c["regionCode"] == "US")
+        assert us["price"] == {"currencyCode": "USD", "units": "57", "nanos": 990000000}
+        assert us["newSubscriberAvailability"] is True
+        monetization.subscriptions.return_value.basePlans.return_value.activate.assert_called_once()
+
+    def test_idempotent_when_subscription_exists(self):
+        svc = _mock_service()
+        monetization = svc.monetization.return_value
+        monetization.subscriptions.return_value.get.return_value.execute.return_value = {
+            "productId": "me.example.premium_annual",
+            "basePlans": [{"basePlanId": "annual"}],
+        }
+        result = create_subscription(
+            svc, "com.example.app", "me.example.premium_annual",
+            base_plan_id="annual",
+            billing_period="P1Y",
+            listings={"en-US": {"title": "Premium Annual"}},
+        )
+        assert result["created"] is False
+        monetization.subscriptions.return_value.create.assert_not_called()
+
+    def test_requires_listing_title(self):
+        svc = _mock_service()
+        monetization = svc.monetization.return_value
+        monetization.subscriptions.return_value.get.return_value.execute.side_effect = Exception("404")
+        with pytest.raises(ValueError, match="title"):
+            create_subscription(
+                svc, "com.example.app", "me.example.premium_annual",
+                base_plan_id="annual",
+                billing_period="P1Y",
+                listings={"en-US": {"description": "no title here"}},
+            )
 
 
 # ======================================================================

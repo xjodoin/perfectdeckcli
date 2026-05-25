@@ -8,8 +8,8 @@ Statuses: `typed-supported`, `generic-supported`, `planned`, `console-only`, `no
 
 - Total categories: 236
 - console-only: 2
-- generic-supported: 190
-- typed-supported: 44
+- generic-supported: 189
+- typed-supported: 45
 
 ## Operation Registry
 
@@ -250,7 +250,7 @@ Statuses: `typed-supported`, `generic-supported`, `planned`, `console-only`, `no
 | play_android_publisher | `monetization.onetimeproducts` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
 | play_android_publisher | `monetization.onetimeproducts.purchaseOptions` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
 | play_android_publisher | `monetization.subscriptions` | typed-supported | official-api | Typed CLI/MCP workflow exists. |
-| play_android_publisher | `monetization.subscriptions.basePlans` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
+| play_android_publisher | `monetization.subscriptions.basePlans` | typed-supported | official-api | Typed CLI/MCP workflow exists. |
 | play_android_publisher | `monetization.subscriptions.basePlans.offers` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
 | play_android_publisher | `monetization.subscriptionsv2` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
 | play_android_publisher | `orders` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |

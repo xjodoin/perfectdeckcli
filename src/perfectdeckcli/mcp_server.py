@@ -1015,6 +1015,30 @@ class SyncPlaySubscriptionPricingInput(BaseModel):
     )
 
 
+class CreatePlaySubscriptionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    project_path: str = Field(default=".", min_length=1)
+    app: str | None = Field(default=None, description="App identifier for credential resolution.")
+    package_name: str | None = Field(default=None, description="Resolved from stored credentials if omitted.")
+    credentials_path: str | None = Field(default=None)
+    subscription_id: str = Field(..., min_length=1, description="Product id, e.g. ...premium_annual")
+    base_plan_id: str = Field(..., min_length=1, description="RFC-1034 base-plan id, e.g. 'annual'")
+    billing_period: str = Field(
+        ..., min_length=2,
+        description="ISO-8601 billing period, e.g. P1Y (annual), P1M (monthly).",
+    )
+    grace_period: str | None = Field(default=None, description="ISO-8601, e.g. P3D.")
+    activate: bool = Field(default=True, description="Activate the base plan after create (makes it sellable).")
+    listings: dict[str, dict[str, Any]] | None = Field(
+        default=None,
+        description="{languageCode: {title, description?, benefits?}}. Auto-loaded from the local listing's subscription localizations when omitted.",
+    )
+    regional_prices: dict[str, dict[str, Any]] | None = Field(
+        default=None,
+        description="{region_code: {currency, price}}. Auto-loaded from the local listing's base_plans.<base_plan_id>.pricing when omitted.",
+    )
+
+
 class AppStoreSalesReportInput(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     project_path: str = Field(default=".", min_length=1)
@@ -2906,6 +2930,67 @@ def perfectdeck_sync_play_subscription_pricing(params: SyncPlaySubscriptionPrici
     if params.app:
         _persist_play_credentials(params.project_path, params.app, pkg, creds)
     return _result(out, "perfectdeck_sync_play_subscription_pricing")
+
+
+@mcp.tool(
+    name="perfectdeck_create_play_subscription",
+    annotations={
+        "title": "Create Google Play Subscription",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def perfectdeck_create_play_subscription(params: CreatePlaySubscriptionInput) -> str:
+    """Create an auto-renewing Google Play subscription with one base plan, then
+    activate it so it's sellable.
+
+    The base plan's billing period (e.g. P1Y) is required since the local
+    listing doesn't encode it. Listings and regional pricing are auto-loaded
+    from the local listing (subscription localizations +
+    base_plans.<base_plan_id>.pricing) when not passed explicitly. Idempotent:
+    an existing subscription is left intact and only (re)activated — use
+    perfectdeck_sync_play_subscription_pricing to update its pricing.
+    """
+    if params.app:
+        pkg, creds = _resolve_play_credentials(params.project_path, params.app, params.package_name, params.credentials_path)
+    else:
+        if not params.package_name:
+            raise ValueError("package_name is required when app is not set for credential resolution.")
+        pkg, creds = params.package_name, params.credentials_path
+
+    listings = params.listings
+    regional_prices = params.regional_prices
+    if (listings is None or regional_prices is None) and params.app:
+        section = _router().service_for(params.project_path).list_section(params.app, "play")
+        sub = section.get("subscriptions", {}).get(params.subscription_id, {})
+        if listings is None:
+            listings = sub.get("localizations", {})
+        if regional_prices is None:
+            base_plan = sub.get("base_plans", {}).get(params.base_plan_id, {})
+            regional_prices = base_plan.get("pricing", {})
+
+    if not listings:
+        raise ValueError(
+            "No listings found. Provide listings or configure the subscription locally."
+        )
+
+    api = play_store_api.create_service(credentials_path=creds)
+    out = play_store_api.create_subscription(
+        service=api,
+        package_name=pkg,
+        subscription_id=params.subscription_id,
+        base_plan_id=params.base_plan_id,
+        billing_period=params.billing_period,
+        listings=listings,
+        regional_prices=regional_prices or {},
+        grace_period=params.grace_period,
+        activate=params.activate,
+    )
+    if params.app:
+        _persist_play_credentials(params.project_path, params.app, pkg, creds)
+    return _result(out, "perfectdeck_create_play_subscription")
 
 
 # ======================================================================

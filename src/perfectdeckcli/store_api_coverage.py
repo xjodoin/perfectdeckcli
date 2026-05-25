@@ -263,6 +263,7 @@ PLAY_ANDROID_TYPED = frozenset({
     "edits.deobfuscationfiles",
     "inappproducts",
     "monetization.subscriptions",
+    "monetization.subscriptions.basePlans",
 })
 
 PLAY_ANDROID_CATEGORIES = (
