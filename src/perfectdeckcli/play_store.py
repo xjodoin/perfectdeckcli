@@ -1282,10 +1282,31 @@ def _price_to_money(currency: str, price: float) -> Dict[str, str]:
     return _micro_price_to_money(currency, int(round(price * 1_000_000)))
 
 
+# Currencies Google Play prices in whole units only — fractional amounts are
+# rejected ("the price for <region> must be rounded"). Covers ISO-4217
+# zero-decimal currencies plus ones Google treats as whole (HUF, IDR, TWD, COP).
+_ZERO_DECIMAL_CURRENCIES = frozenset({
+    "BIF", "CLP", "COP", "DJF", "GNF", "HUF", "IDR", "ISK", "JPY", "KMF",
+    "KRW", "MMK", "MNT", "PYG", "RWF", "TWD", "UGX", "VND", "VUV", "XAF",
+    "XOF", "XPF",
+})
+
+
 def _price_to_money_proto(currency: str, price: float) -> Dict[str, Any]:
-    """Convert a price to the Money proto format used by the new monetization API."""
+    """Convert a price to the Money proto format used by the monetization API.
+
+    Zero-decimal currencies (e.g. JPY, XOF, IDR) are rounded to whole units —
+    Google Play rejects fractional amounts for them. Other currencies snap to
+    2-decimal precision to avoid float dust producing invalid nanos.
+    """
+    if currency.upper() in _ZERO_DECIMAL_CURRENCIES:
+        return {"currencyCode": currency, "units": str(int(round(price))), "nanos": 0}
     units = int(price)
     nanos = int(round((price - units) * 1_000_000_000))
+    nanos = round(nanos / 10_000_000) * 10_000_000  # snap to 2 decimals
+    if nanos >= 1_000_000_000:
+        units += 1
+        nanos -= 1_000_000_000
     return {"currencyCode": currency, "units": str(units), "nanos": nanos}
 
 

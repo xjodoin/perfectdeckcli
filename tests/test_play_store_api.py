@@ -17,6 +17,7 @@ from perfectdeckcli.play_store import (
     _compute_sha1,
     _execute_with_retry,
     _price_to_money,
+    _price_to_money_proto,
     apply_regional_pricing,
     apply_subscription_regional_pricing,
     create_service,
@@ -1144,6 +1145,23 @@ class TestApplySubscriptionRegionalPricing:
             {"US": {"currency": "USD", "price": 9.99}},
         )
         assert result["ok"] is True
+
+
+class TestPriceToMoneyProto:
+    def test_zero_decimal_currency_rounds_to_whole(self):
+        # Google Play rejects fractional XOF/IDR/etc. — must be whole units.
+        assert _price_to_money_proto("XOF", 11195.99) == {
+            "currencyCode": "XOF", "units": "11196", "nanos": 0,
+        }
+        assert _price_to_money_proto("IDR", 395999.99) == {
+            "currencyCode": "IDR", "units": "396000", "nanos": 0,
+        }
+        assert _price_to_money_proto("JPY", 6900.0)["nanos"] == 0
+
+    def test_two_decimal_currency_keeps_nanos(self):
+        assert _price_to_money_proto("USD", 57.99) == {
+            "currencyCode": "USD", "units": "57", "nanos": 990000000,
+        }
 
 
 # ======================================================================
