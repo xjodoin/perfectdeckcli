@@ -13,6 +13,36 @@ def test_get_missing_key_raises_key_error() -> None:
         service.get_element(app="prod", store="play", key_path="missing", locale="en-US")
 
 
+def test_set_products_merge_preserves_existing_pricing() -> None:
+    """A partial subscription sync must not shrink existing pricing/localizations."""
+    service = ListingService(InMemoryStorageBackend())
+    service.init_listing(app="prod", stores=["app_store"], locales=["en-US"])
+    sid = "com.example.annual"
+    service.set_products("prod", "app_store", {}, {sid: {
+        "group_name": "Premium",
+        "localizations": {"en-US": {"name": "Annual", "description": "Full"}},
+        "pricing": {
+            "USA": {"currency": "USD", "price": 57.99},
+            "CAN": {"currency": "CAD", "price": 71.99},
+            "GBR": {"currency": "GBP", "price": 42.99},
+        },
+    }})
+    # Partial re-sync: only USA price + just the name localization.
+    service.set_products("prod", "app_store", {}, {sid: {
+        "localizations": {"en-US": {"name": "Annual v2"}},
+        "pricing": {"USA": {"currency": "USD", "price": 59.99}},
+    }})
+    sub = service.list_section("prod", "app_store")["subscriptions"][sid]
+    # Pricing kept all territories; USA updated, others preserved.
+    assert set(sub["pricing"].keys()) == {"USA", "CAN", "GBR"}
+    assert sub["pricing"]["USA"]["price"] == 59.99
+    assert sub["pricing"]["CAN"]["price"] == 71.99
+    # Localization deep-merged: name updated, description preserved.
+    assert sub["localizations"]["en-US"]["name"] == "Annual v2"
+    assert sub["localizations"]["en-US"]["description"] == "Full"
+    assert sub["group_name"] == "Premium"
+
+
 def test_delete_missing_key_returns_false() -> None:
     service = ListingService(InMemoryStorageBackend())
     service.init_listing(app="prod", locales=["en-US"])

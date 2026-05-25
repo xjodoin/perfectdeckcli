@@ -13,6 +13,23 @@ if TYPE_CHECKING:
     from .storage import StorageBackend
 
 
+def _deep_merge_dict(dst: MutableMapping[str, Any], src: Dict[str, Any]) -> None:
+    """Recursively merge *src* into *dst* in place.
+
+    Nested dicts are merged key-by-key rather than wholesale-replaced, so a
+    partial update (e.g. pricing for a subset of territories, or one locale)
+    never drops entries already present in *dst*. This is what keeps a partial
+    IAP/subscription sync from shrinking the local listing's pricing or
+    localizations. To replace wholesale instead, use ``merge=False``.
+    """
+    for key, value in src.items():
+        existing = dst.get(key)
+        if isinstance(value, dict) and isinstance(existing, dict):
+            _deep_merge_dict(existing, value)
+        else:
+            dst[key] = deepcopy(value)
+
+
 def _split_key_path(key_path: str) -> List[str]:
     parts = [part.strip() for part in key_path.split(".") if part.strip()]
     if not parts:
@@ -596,14 +613,14 @@ class ListingService:
             for pid, pcfg in products.items():
                 existing = section["products"].get(pid)
                 if isinstance(existing, dict) and isinstance(pcfg, dict):
-                    existing.update(deepcopy(pcfg))
+                    _deep_merge_dict(existing, pcfg)
                 else:
                     section["products"][pid] = deepcopy(pcfg)
             if subscriptions:
                 for sid, scfg in subscriptions.items():
                     existing = section["subscriptions"].get(sid)
                     if isinstance(existing, dict) and isinstance(scfg, dict):
-                        existing.update(deepcopy(scfg))
+                        _deep_merge_dict(existing, scfg)
                     else:
                         section["subscriptions"][sid] = deepcopy(scfg)
         else:

@@ -856,7 +856,10 @@ class SyncAppStoreSubscriptionsInput(BaseModel):
     subscriptions: list[dict[str, Any]] | None = Field(
         default=None,
         description=(
-            "List of {product_id, localizations: {locale: {name, description}}}. "
+            "List of {product_id, localizations: {locale: {name, description}}, pricing}. "
+            "A subscription that does not exist yet is created when the item also "
+            "includes subscription_period (e.g. ONE_YEAR) and group_name; optional "
+            "group_level (default 1) and family_sharable (default False). "
             "When omitted and app is provided, subscriptions are auto-loaded from the local listing."
         ),
     )
@@ -3758,6 +3761,17 @@ def _local_products_to_app_store_list(products: dict[str, Any]) -> list[dict[str
             entry["localizations"] = cfg["localizations"]
         if "pricing" in cfg:
             entry["pricing"] = cfg["pricing"]
+        # Creation metadata (App Store subscriptions): passed through so a
+        # missing subscription can be created during sync.
+        for key in (
+            "group_name",
+            "subscription_period",
+            "group_level",
+            "family_sharable",
+            "name",
+        ):
+            if key in cfg:
+                entry[key] = cfg[key]
         result.append(entry)
     return result
 
@@ -4012,11 +4026,22 @@ def perfectdeck_sync_app_store_iap(params: SyncAppStoreIapInput) -> str:
     },
 )
 def perfectdeck_sync_app_store_subscriptions(params: SyncAppStoreSubscriptionsInput) -> str:
-    """Sync subscription localizations and pricing to App Store Connect.
+    """Create and/or sync App Store subscriptions (localizations + pricing).
 
-    When subscriptions is omitted, all subscriptions from the local listing are synced automatically.
-    Set delete_missing=true to remove remote localizations not present in the local listing.
-    Subscriptions that have a ``pricing`` field will have their regional pricing pushed automatically.
+    A subscription that does not exist yet is created automatically when its
+    item includes ``subscription_period`` (e.g. ``ONE_YEAR``) and ``group_name``
+    (the group is created if needed); created product ids are reported under
+    ``created_subscriptions``. Existing subscriptions just get their
+    localizations and pricing synced.
+
+    Pricing automatically configures the subscription's availability first
+    (App Store rejects pricing otherwise for a new subscription), then sets each
+    territory's price; per-territory failures are reported under ``failed``
+    rather than aborting the batch.
+
+    When subscriptions is omitted, all subscriptions from the local listing are
+    synced automatically. Set delete_missing=true to remove remote localizations
+    not present in the local listing.
     """
     if params.app:
         r_app_id, r_key_id, r_issuer_id, r_pk = _resolve_app_store_credentials(

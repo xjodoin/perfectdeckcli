@@ -50,6 +50,7 @@ APPLE_TYPED = frozenset({
     "reviewSubmissionItems",
     "reviewSubmissions",
     "salesReports",
+    "subscriptionAvailabilities",
     "subscriptionGroups",
     "subscriptionLocalizations",
     "subscriptionPricePoints",

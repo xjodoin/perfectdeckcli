@@ -1636,6 +1636,24 @@ class AppStoreConnectClient:
         Returns ``{"territories_set": int, "territories_skipped": [...], "already_set": int}``.
         """
         territories = list(pricing.keys())
+
+        # App Store Connect rejects price creation until the subscription has an
+        # availability configured (409 ENTITY_ERROR.RELATIONSHIP.INVALID). Ensure
+        # one exists, covering the territories we're about to price. Apple can
+        # 500 when creating availability for very large territory sets (>~50);
+        # don't let that abort pricing — proceed best-effort and report it.
+        availability_error: str | None = None
+        try:
+            availability = self.ensure_subscription_availability(
+                subscription_id, territories,
+            )
+            availability_created = availability["created"]
+            available_territories = availability["available_territories"]
+        except RuntimeError as exc:
+            availability_created = False
+            available_territories = set()
+            availability_error = str(exc)[:300]
+
         price_points = self._fetch_price_points_paginated(
             f"/v1/subscriptions/{subscription_id}/pricePoints",
             territories=territories,
@@ -1680,6 +1698,8 @@ class AppStoreConnectClient:
         set_count = 0
         already_set = 0
         not_found: List[str] = []
+        skipped_unavailable: List[str] = []
+        failed: List[Dict[str, str]] = []
 
         for territory, price_info in pricing.items():
             target_price = float(price_info.get("price", 0))
@@ -1700,27 +1720,49 @@ class AppStoreConnectClient:
                 already_set += 1
                 continue
 
-            self.request(
-                "POST",
-                "/v1/subscriptionPrices",
-                json_body={
-                    "data": {
-                        "type": "subscriptionPrices",
-                        "attributes": {"startDate": None, "preserveCurrentPrice": False},
-                        "relationships": {
-                            "subscription": {
-                                "data": {"type": "subscriptions", "id": subscription_id},
-                            },
-                            "subscriptionPricePoint": {
-                                "data": {"type": "subscriptionPricePoints", "id": best_pp_id},
+            # When availability pre-existed we can only price territories it
+            # already covers; pricing an unavailable territory would 409.
+            if (
+                not availability_created
+                and available_territories
+                and territory not in available_territories
+            ):
+                skipped_unavailable.append(territory)
+                continue
+
+            try:
+                self.request(
+                    "POST",
+                    "/v1/subscriptionPrices",
+                    json_body={
+                        "data": {
+                            "type": "subscriptionPrices",
+                            "attributes": {"startDate": None, "preserveCurrentPrice": False},
+                            "relationships": {
+                                "subscription": {
+                                    "data": {"type": "subscriptions", "id": subscription_id},
+                                },
+                                "subscriptionPricePoint": {
+                                    "data": {"type": "subscriptionPricePoints", "id": best_pp_id},
+                                },
                             },
                         },
                     },
-                },
-            )
-            set_count += 1
+                )
+                set_count += 1
+            except RuntimeError as exc:
+                # Don't let one bad territory abort the rest of the batch.
+                failed.append({"territory": territory, "error": str(exc)[:300]})
 
-        return {"territories_set": set_count, "territories_skipped": not_found, "already_set": already_set}
+        return {
+            "territories_set": set_count,
+            "territories_skipped": not_found,
+            "already_set": already_set,
+            "skipped_unavailable": skipped_unavailable,
+            "availability_created": availability_created,
+            "availability_error": availability_error,
+            "failed": failed,
+        }
 
     # ------------------------------------------------------------------
     # In-app purchase management
@@ -1845,6 +1887,183 @@ class AppStoreConnectClient:
                 if sub.get("attributes", {}).get("productId") == product_id:
                     return sub["id"]
         return None
+
+    def find_subscription_group_id(
+        self, app_id: str, group_name: str,
+    ) -> str | None:
+        """Find a subscription group resource ID by its reference name."""
+        data = self.request(
+            "GET",
+            f"/apps/{app_id}/subscriptionGroups",
+            params={"limit": "50"},
+        )
+        for group in data.get("data", []):
+            if group.get("attributes", {}).get("referenceName") == group_name:
+                return group["id"]
+        return None
+
+    def create_subscription_group(self, app_id: str, reference_name: str) -> str:
+        """Create a subscription group. Returns the new group ID."""
+        data = self.request(
+            "POST",
+            "/v1/subscriptionGroups",
+            json_body={
+                "data": {
+                    "type": "subscriptionGroups",
+                    "attributes": {"referenceName": reference_name},
+                    "relationships": {
+                        "app": {"data": {"type": "apps", "id": app_id}},
+                    },
+                }
+            },
+        )
+        return data.get("data", {}).get("id", "")
+
+    def create_subscription(
+        self,
+        group_id: str,
+        product_id: str,
+        name: str,
+        subscription_period: str,
+        *,
+        group_level: int = 1,
+        family_sharable: bool = False,
+        review_note: str | None = None,
+    ) -> str:
+        """Create an auto-renewable subscription in a group. Returns its ID.
+
+        *subscription_period* is an App Store Connect enum: ``ONE_WEEK``,
+        ``ONE_MONTH``, ``TWO_MONTHS``, ``THREE_MONTHS``, ``SIX_MONTHS`` or
+        ``ONE_YEAR``. The created subscription starts in ``MISSING_METADATA``
+        until localizations, availability and pricing are added.
+        """
+        attributes: Dict[str, Any] = {
+            "name": name,
+            "productId": product_id,
+            "subscriptionPeriod": subscription_period,
+            "familySharable": family_sharable,
+            "groupLevel": group_level,
+        }
+        if review_note is not None:
+            attributes["reviewNote"] = review_note
+        data = self.request(
+            "POST",
+            "/v1/subscriptions",
+            json_body={
+                "data": {
+                    "type": "subscriptions",
+                    "attributes": attributes,
+                    "relationships": {
+                        "group": {
+                            "data": {"type": "subscriptionGroups", "id": group_id},
+                        },
+                    },
+                }
+            },
+        )
+        return data.get("data", {}).get("id", "")
+
+    def get_subscription_availability(
+        self, subscription_id: str,
+    ) -> Dict[str, Any] | None:
+        """Return availability info for a subscription, or None if unset.
+
+        Result: ``{"available_in_new_territories": bool, "territories": set[str]}``.
+        The territory list is paginated (App Store caps the page size at 50).
+        """
+        try:
+            data = self.request(
+                "GET",
+                f"/v1/subscriptions/{subscription_id}/subscriptionAvailability",
+            )
+        except RuntimeError as exc:
+            if "404" in str(exc):
+                return None
+            raise
+        avail = data.get("data", {})
+        avail_id = avail.get("id") or subscription_id
+        in_new = avail.get("attributes", {}).get("availableInNewTerritories", True)
+
+        territories: set[str] = set()
+        base_domain = self.base_url.rsplit("/v", 1)[0]
+        next_path: str | None = (
+            f"/v1/subscriptionAvailabilities/{avail_id}/availableTerritories"
+        )
+        next_params: Dict[str, str] | None = {"limit": "50"}
+        while next_path:
+            resp = self.request("GET", next_path, params=next_params)
+            for item in resp.get("data", []):
+                tid = item.get("id")
+                if tid:
+                    territories.add(tid)
+            nxt = resp.get("links", {}).get("next")
+            if nxt and isinstance(nxt, str) and nxt.startswith(base_domain):
+                next_path = nxt[len(base_domain):]
+                next_params = None
+            else:
+                break
+
+        return {
+            "available_in_new_territories": in_new,
+            "territories": territories,
+        }
+
+    def ensure_subscription_availability(
+        self,
+        subscription_id: str,
+        territories: Sequence[str],
+        *,
+        available_in_new_territories: bool = True,
+    ) -> Dict[str, Any]:
+        """Ensure the subscription has an availability configured.
+
+        App Store Connect rejects subscription price creation with HTTP 409
+        ``ENTITY_ERROR.RELATIONSHIP.INVALID`` (pointer ``subscriptionPricePoint``)
+        until the subscription has a ``subscriptionAvailability`` — so this MUST
+        run before pricing a brand-new subscription. When none exists it is
+        created covering *territories*; an existing availability is left intact
+        (the ``subscriptionAvailabilities`` resource only allows CREATE/GET and
+        its ``availableTerritories`` relationship is read-only, so it can't be
+        expanded in place).
+
+        Note: App Store Connect can return HTTP 500 when a single create lists a
+        very large territory set (empirically >~50). For broader coverage set
+        ``availableInNewTerritories`` and/or finish availability in the App Store
+        Connect UI, which handles bulk territory selection server-side.
+
+        Returns ``{"created": bool, "available_territories": set[str]}``.
+        """
+        existing = self.get_subscription_availability(subscription_id)
+        if existing is not None:
+            return {
+                "created": False,
+                "available_territories": existing["territories"],
+            }
+
+        wanted = [t for t in dict.fromkeys(territories) if t]
+        self.request(
+            "POST",
+            "/v1/subscriptionAvailabilities",
+            json_body={
+                "data": {
+                    "type": "subscriptionAvailabilities",
+                    "attributes": {
+                        "availableInNewTerritories": available_in_new_territories,
+                    },
+                    "relationships": {
+                        "subscription": {
+                            "data": {"type": "subscriptions", "id": subscription_id},
+                        },
+                        "availableTerritories": {
+                            "data": [
+                                {"type": "territories", "id": t} for t in wanted
+                            ],
+                        },
+                    },
+                }
+            },
+        )
+        return {"created": True, "available_territories": set(wanted)}
 
     def list_subscription_localizations(
         self, subscription_id: str,
@@ -2472,40 +2691,101 @@ def sync_iap_localizations(
     }
 
 
+def ensure_subscription_exists(
+    client: AppStoreConnectClient,
+    app_id: str,
+    sub: Dict[str, Any],
+) -> tuple[str | None, bool]:
+    """Find a subscription by ``product_id``, creating it when absent.
+
+    Creation requires ``subscription_period`` (App Store enum such as
+    ``ONE_YEAR``) and a group. The group is resolved from ``group_name`` and
+    created if it does not exist. The display ``name`` falls back to the en-US
+    localization name, then the product-id tail. Optional ``group_level``
+    (default 1) and ``family_sharable`` (default False) are honoured.
+
+    Returns ``(subscription_id_or_None, created)``. When the subscription is
+    missing and not enough info is provided to create it, returns ``(None, False)``.
+    """
+    product_id = sub.get("product_id", "")
+    sub_id = client.find_subscription_id(app_id, product_id)
+    if sub_id is not None:
+        return sub_id, False
+
+    period = sub.get("subscription_period")
+    if not period:
+        return None, False  # cannot create without a billing period
+
+    group_name = sub.get("group_name")
+    if not group_name:
+        return None, False  # cannot create without a subscription group
+    group_id = client.find_subscription_group_id(app_id, group_name)
+    if group_id is None:
+        group_id = client.create_subscription_group(app_id, group_name)
+
+    name = sub.get("name")
+    if not name:
+        locs = sub.get("localizations", {}) or {}
+        chosen = locs.get("en-US") or (next(iter(locs.values()), {}) if locs else {})
+        name = (chosen or {}).get("name") or product_id.rsplit(".", 1)[-1]
+    name = str(name)[:30]
+
+    new_id = client.create_subscription(
+        group_id,
+        product_id,
+        name,
+        str(period),
+        group_level=int(sub.get("group_level", 1)),
+        family_sharable=bool(sub.get("family_sharable", False)),
+    )
+    return new_id, True
+
+
 def sync_subscription_localizations(
     client: AppStoreConnectClient,
     app_id: str,
     subscriptions: Sequence[Dict[str, Any]],
     delete_missing: bool = False,
 ) -> Dict[str, Any]:
-    """Sync subscription localizations.
+    """Sync subscription localizations, creating missing subscriptions.
 
     Each item in *subscriptions*::
 
-        {"product_id": "com.example.premium", "localizations": {
+        {"product_id": "com.example.premium",
+         "group_name": "Premium",            # required to create
+         "subscription_period": "ONE_YEAR",  # required to create
+         "group_level": 1,                    # optional (default 1)
+         "family_sharable": false,            # optional (default False)
+         "localizations": {
             "en-US": {"name": "Premium", "description": "Premium access"},
             ...
         }}
 
-    When *delete_missing* is True, remote localizations not present in the
-    local list are deleted from App Store Connect.
+    A subscription that doesn't exist yet is created when ``subscription_period``
+    and ``group_name`` are present; otherwise its product id is reported under
+    ``missing_subscriptions``. When *delete_missing* is True, remote
+    localizations not present in the local list are deleted.
 
-    Returns ``{"ok": True, "created": int, "updated": int, "deleted": int, "missing_subscriptions": [...]}``.
+    Returns ``{"ok": True, "created": int, "updated": int, "deleted": int,
+    "created_subscriptions": [...], "missing_subscriptions": [...]}``.
     """
     created_count = 0
     updated_count = 0
     deleted_count = 0
     skipped_count = 0
     missing: List[str] = []
+    created_subscriptions: List[str] = []
 
     for sub in subscriptions:
         product_id = sub["product_id"]
         localizations = sub.get("localizations", {})
 
-        sub_id = client.find_subscription_id(app_id, product_id)
+        sub_id, was_created = ensure_subscription_exists(client, app_id, sub)
         if sub_id is None:
             missing.append(product_id)
             continue
+        if was_created:
+            created_subscriptions.append(product_id)
 
         existing = client.list_subscription_localizations(sub_id)
 
@@ -2543,6 +2823,7 @@ def sync_subscription_localizations(
         "updated": updated_count,
         "deleted": deleted_count,
         "skipped_active": skipped_count,
+        "created_subscriptions": created_subscriptions,
         "missing_subscriptions": missing,
     }
 
@@ -2603,6 +2884,7 @@ def sync_subscription_pricing(
     subscriptions_updated = 0
     total_territories = 0
     missing: List[str] = []
+    failed: List[Dict[str, str]] = []
 
     for sub in subscriptions:
         product_id = sub.get("product_id", "")
@@ -2610,7 +2892,7 @@ def sync_subscription_pricing(
         if not pricing:
             continue
 
-        sub_id = client.find_subscription_id(app_id, product_id)
+        sub_id, _ = ensure_subscription_exists(client, app_id, sub)
         if sub_id is None:
             missing.append(product_id)
             continue
@@ -2618,12 +2900,15 @@ def sync_subscription_pricing(
         result = client.set_subscription_pricing(sub_id, pricing)
         subscriptions_updated += 1
         total_territories += result.get("territories_set", 0)
+        for item in result.get("failed", []):
+            failed.append({"product_id": product_id, **item})
 
     return {
         "ok": True,
         "subscriptions_updated": subscriptions_updated,
         "territories_set": total_territories,
         "missing_subscriptions": missing,
+        "failed": failed,
     }
 
 

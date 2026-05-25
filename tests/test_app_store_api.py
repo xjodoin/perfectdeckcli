@@ -11,12 +11,14 @@ from perfectdeckcli.app_store import (
     VALID_DISPLAY_TYPES,
     AppStoreConnectClient,
     _parse_pricing_response,
+    ensure_subscription_exists,
     fetch_iap_and_subscriptions,
     parse_gzip_tabular_report,
     fetch_listings,
     push_listings,
     sync_iap_localizations,
     sync_subscription_localizations,
+    sync_subscription_pricing,
     upload_screenshots,
 )
 
@@ -1166,6 +1168,219 @@ class TestSyncSubscriptionLocalizations:
             {"product_id": "missing", "localizations": {}},
         ])
         assert result["missing_subscriptions"] == ["missing"]
+
+
+# ======================================================================
+# Subscription creation + availability
+# ======================================================================
+
+
+class TestSubscriptionCreation:
+    def test_create_subscription(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(
+            201, {"data": {"id": "sub-new"}}
+        )
+        sub_id = client.create_subscription(
+            "group-1", "com.example.annual", "Premium Annual", "ONE_YEAR",
+        )
+        assert sub_id == "sub-new"
+        # Verify body: period + group relationship
+        _, kwargs = client.session.request.call_args
+        body = kwargs["json"]["data"]
+        assert body["attributes"]["subscriptionPeriod"] == "ONE_YEAR"
+        assert body["attributes"]["productId"] == "com.example.annual"
+        assert body["relationships"]["group"]["data"]["id"] == "group-1"
+
+    def test_find_subscription_group_id(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(200, {
+            "data": [
+                {"id": "g-1", "attributes": {"referenceName": "Other"}},
+                {"id": "g-2", "attributes": {"referenceName": "Premium"}},
+            ]
+        })
+        assert client.find_subscription_group_id("app123", "Premium") == "g-2"
+        assert client.find_subscription_group_id("app123", "Nope") is None
+
+    def test_ensure_availability_creates_when_missing(self):
+        client = _mock_client()
+        # GET availability -> 404, then POST availability
+        client.session.request.side_effect = [
+            _mock_response(404, text="not found"),
+            _mock_response(201, {"data": {"id": "avail-1"}}),
+        ]
+        result = client.ensure_subscription_availability("sub-1", ["USA", "CAN"])
+        assert result["created"] is True
+        assert result["available_territories"] == {"USA", "CAN"}
+
+    def test_ensure_availability_existing_is_left_intact(self):
+        client = _mock_client()
+        client.session.request.side_effect = [
+            # GET availability resource
+            _mock_response(200, {
+                "data": {"id": "avail-1", "attributes": {"availableInNewTerritories": True}},
+            }),
+            # GET availableTerritories (paginated, page size 50)
+            _mock_response(200, {"data": [{"type": "territories", "id": "USA"}], "links": {}}),
+        ]
+        result = client.ensure_subscription_availability("sub-1", ["USA", "CAN"])
+        assert result["created"] is False
+        assert result["available_territories"] == {"USA"}
+
+    def test_get_availability_paginates_territories(self):
+        client = _mock_client()
+        base = client.base_url.rsplit("/v", 1)[0]
+        client.session.request.side_effect = [
+            _mock_response(200, {"data": {"id": "avail-1", "attributes": {"availableInNewTerritories": False}}}),
+            _mock_response(200, {
+                "data": [{"type": "territories", "id": "USA"}],
+                "links": {"next": f"{base}/v1/subscriptionAvailabilities/avail-1/availableTerritories?cursor=B"},
+            }),
+            _mock_response(200, {"data": [{"type": "territories", "id": "CAN"}], "links": {}}),
+        ]
+        result = client.get_subscription_availability("sub-1")
+        assert result["available_in_new_territories"] is False
+        assert result["territories"] == {"USA", "CAN"}
+
+    def test_set_pricing_configures_availability_first(self):
+        client = _mock_client()
+        client._fetch_price_points_paginated = lambda *a, **k: {
+            "USA": {"pp-usa": 57.99}
+        }
+        # 1) GET availability -> 404 (missing)
+        # 2) POST availability
+        # 3) GET existing prices -> empty
+        # 4) POST price
+        client.session.request.side_effect = [
+            _mock_response(404, text="not found"),
+            _mock_response(201, {"data": {"id": "avail-1"}}),
+            _mock_response(200, {"data": [], "links": {}}),
+            _mock_response(201, {"data": {"id": "price-1"}}),
+        ]
+        result = client.set_subscription_pricing(
+            "sub-1", {"USA": {"currency": "USD", "price": 57.99}}
+        )
+        assert result["availability_created"] is True
+        assert result["territories_set"] == 1
+        assert result["failed"] == []
+
+    def test_set_pricing_collects_failures(self):
+        client = _mock_client()
+        client._fetch_price_points_paginated = lambda *a, **k: {
+            "USA": {"pp-usa": 57.99}
+        }
+        client.session.request.side_effect = [
+            _mock_response(404, text="not found"),      # GET availability
+            _mock_response(201, {"data": {"id": "a"}}),  # POST availability
+            _mock_response(200, {"data": [], "links": {}}),  # GET prices
+            _mock_response(409, text="bad price point"),  # POST price -> fails
+        ]
+        result = client.set_subscription_pricing(
+            "sub-1", {"USA": {"currency": "USD", "price": 57.99}}
+        )
+        assert result["territories_set"] == 0
+        assert len(result["failed"]) == 1
+        assert result["failed"][0]["territory"] == "USA"
+
+
+class TestEnsureSubscriptionExists:
+    def test_creates_when_missing_with_period(self):
+        client = _mock_client()
+        client.session.request.side_effect = [
+            # find_subscription_id: groups + that group's subs (no match)
+            _mock_response(200, {"data": [{"id": "g-1", "attributes": {"referenceName": "Premium"}}]}),
+            _mock_response(200, {"data": []}),
+            # find_subscription_group_id: groups
+            _mock_response(200, {"data": [{"id": "g-1", "attributes": {"referenceName": "Premium"}}]}),
+            # create_subscription
+            _mock_response(201, {"data": {"id": "sub-new"}}),
+        ]
+        sub_id, created = ensure_subscription_exists(client, "app123", {
+            "product_id": "com.example.annual",
+            "group_name": "Premium",
+            "subscription_period": "ONE_YEAR",
+            "localizations": {"en-US": {"name": "Premium Annual"}},
+        })
+        assert sub_id == "sub-new"
+        assert created is True
+
+    def test_returns_none_without_period(self):
+        client = _mock_client()
+        # find_subscription_id: no groups -> None; no period -> cannot create
+        client.session.request.side_effect = [_mock_response(200, {"data": []})]
+        sub_id, created = ensure_subscription_exists(client, "app123", {
+            "product_id": "com.example.annual",
+            "group_name": "Premium",
+        })
+        assert sub_id is None
+        assert created is False
+
+    def test_existing_subscription_not_recreated(self):
+        client = _mock_client()
+        client.session.request.side_effect = [
+            _mock_response(200, {"data": [{"id": "g-1"}]}),
+            _mock_response(200, {"data": [{"id": "sub-1", "attributes": {"productId": "com.example.annual"}}]}),
+        ]
+        sub_id, created = ensure_subscription_exists(client, "app123", {
+            "product_id": "com.example.annual",
+            "subscription_period": "ONE_YEAR",
+            "group_name": "Premium",
+        })
+        assert sub_id == "sub-1"
+        assert created is False
+
+
+class TestSyncSubscriptionCreatesMissing:
+    def test_localization_sync_creates_subscription(self):
+        client = _mock_client()
+        client.session.request.side_effect = [
+            # ensure_subscription_exists -> find_subscription_id (groups, subs empty)
+            _mock_response(200, {"data": [{"id": "g-1", "attributes": {"referenceName": "Premium"}}]}),
+            _mock_response(200, {"data": []}),
+            # find_subscription_group_id
+            _mock_response(200, {"data": [{"id": "g-1", "attributes": {"referenceName": "Premium"}}]}),
+            # create_subscription
+            _mock_response(201, {"data": {"id": "sub-new"}}),
+            # list_subscription_localizations (empty)
+            _mock_response(200, {"data": []}),
+            # create localization
+            _mock_response(201, {"data": {"id": "sloc-1"}}),
+        ]
+        result = sync_subscription_localizations(client, "app123", [{
+            "product_id": "com.example.annual",
+            "group_name": "Premium",
+            "subscription_period": "ONE_YEAR",
+            "localizations": {"en-US": {"name": "Premium Annual"}},
+        }])
+        assert result["created_subscriptions"] == ["com.example.annual"]
+        assert result["created"] == 1
+        assert result["missing_subscriptions"] == []
+
+    def test_pricing_sync_on_existing_subscription(self):
+        client = _mock_client()
+        client._fetch_price_points_paginated = lambda *a, **k: {
+            "USA": {"pp-usa": 57.99}
+        }
+        client.session.request.side_effect = [
+            # ensure_subscription_exists -> find (groups + match)
+            _mock_response(200, {"data": [{"id": "g-1"}]}),
+            _mock_response(200, {"data": [{"id": "sub-1", "attributes": {"productId": "com.example.annual"}}]}),
+            # set_subscription_pricing: availability resource + territories page
+            _mock_response(200, {"data": {"id": "avail-1", "attributes": {"availableInNewTerritories": True}}}),
+            _mock_response(200, {"data": [{"type": "territories", "id": "USA"}], "links": {}}),
+            # existing prices empty, then POST price
+            _mock_response(200, {"data": [], "links": {}}),
+            _mock_response(201, {"data": {"id": "price-1"}}),
+        ]
+        result = sync_subscription_pricing(client, "app123", [{
+            "product_id": "com.example.annual",
+            "pricing": {"USA": {"currency": "USD", "price": 57.99}},
+        }])
+        assert result["subscriptions_updated"] == 1
+        assert result["territories_set"] == 1
+        assert result["missing_subscriptions"] == []
+        assert result["failed"] == []
 
 
 # ======================================================================

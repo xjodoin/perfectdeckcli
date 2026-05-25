@@ -8,8 +8,8 @@ Statuses: `typed-supported`, `generic-supported`, `planned`, `console-only`, `no
 
 - Total categories: 236
 - console-only: 2
-- generic-supported: 191
-- typed-supported: 43
+- generic-supported: 190
+- typed-supported: 44
 
 ## Operation Registry
 
@@ -203,7 +203,7 @@ Statuses: `typed-supported`, `generic-supported`, `planned`, `console-only`, `no
 | app_store | `scmPullRequests` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
 | app_store | `scmRepositories` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
 | app_store | `subscriptionAppStoreReviewScreenshots` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
-| app_store | `subscriptionAvailabilities` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
+| app_store | `subscriptionAvailabilities` | typed-supported | official-api | Typed CLI/MCP workflow exists. |
 | app_store | `subscriptionGracePeriods` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
 | app_store | `subscriptionGroupLocalizations` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
 | app_store | `subscriptionGroupSubmissions` | generic-supported | official-api | Reachable through the provider generic official API request operation; typed workflow is not implemented yet. |
