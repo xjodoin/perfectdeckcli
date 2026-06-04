@@ -1629,9 +1629,9 @@ class AppStoreConnectClient:
         *pricing* maps ``{territory_3letter: {currency, price}}``.
 
         Fetches available price points, snaps each requested price, then
-        creates or updates prices per territory.  For approved subscriptions
-        the initial price cannot be re-created, so we skip territories that
-        already have pricing and only add new ones.
+        creates or updates prices per territory.  Territories already at the
+        target price point are skipped; territories priced differently get a
+        new price posted (startDate=None — decreases apply immediately).
 
         Returns ``{"territories_set": int, "territories_skipped": [...], "already_set": int}``.
         """
@@ -1715,10 +1715,17 @@ class AppStoreConnectClient:
                 already_set += 1
                 continue
 
-            # For territories that already have pricing, skip — can't change initial price
-            if territory in existing_price_ids:
-                already_set += 1
-                continue
+            # Territories that already have a different price fall through to the
+            # POST below as a *scheduled* price change: Apple rejects a second
+            # startDate=None price ("Initial price cannot be created again"), so
+            # changes carry the earliest allowed startDate (tomorrow, UTC).
+            # Per-territory failures are collected rather than aborting the batch.
+            is_change = territory in existing_price_ids
+            start_date = (
+                (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+                if is_change
+                else None
+            )
 
             # When availability pre-existed we can only price territories it
             # already covers; pricing an unavailable territory would 409.
@@ -1737,7 +1744,7 @@ class AppStoreConnectClient:
                     json_body={
                         "data": {
                             "type": "subscriptionPrices",
-                            "attributes": {"startDate": None, "preserveCurrentPrice": False},
+                            "attributes": {"startDate": start_date, "preserveCurrentPrice": False},
                             "relationships": {
                                 "subscription": {
                                     "data": {"type": "subscriptions", "id": subscription_id},
