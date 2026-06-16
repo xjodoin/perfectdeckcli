@@ -2261,6 +2261,8 @@ def push_listings(
     created_locales: List[str] = []
 
     for locale, fields in sorted(locales_data.items()):
+        created_info_loc = False
+
         # --- App Info localization (name, subtitle, privacy) ---
         if not only_whats_new:
             info_attrs: Dict[str, str | None] = {}
@@ -2277,6 +2279,7 @@ def push_listings(
                     client.update_app_info_localization(existing["id"], **info_attrs)
                 else:
                     client.create_app_info_localization(app_info_id, locale, **info_attrs)
+                    created_info_loc = True
 
         # --- Version localization (description, keywords, promo, whatsNew) ---
         ver_attrs: Dict[str, str | None] = {}
@@ -2299,14 +2302,35 @@ def push_listings(
 
         if ver_attrs:
             existing = existing_version.get(locale)
-            if existing and existing.get("id"):
-                client.update_app_store_version_localization(existing["id"], **ver_attrs)
-                updated_locales.append(locale)
+            loc_id = existing["id"] if (existing and existing.get("id")) else None
+            in_snapshot = loc_id is not None
+
+            # Creating a new app-info localization makes App Store Connect
+            # auto-create the matching version localization. That happens after
+            # the snapshot above was taken, so look it up live and PATCH the
+            # shell rather than POSTing a duplicate (a 409 that aborts the push).
+            if loc_id is None and created_info_loc:
+                loc_id = client.find_app_store_version_localization(version_id, locale)
+
+            if loc_id is not None:
+                client.update_app_store_version_localization(loc_id, **ver_attrs)
             else:
-                client.create_app_store_version_localization(
-                    version_id, locale, **ver_attrs,
-                )
-                created_locales.append(locale)
+                try:
+                    client.create_app_store_version_localization(
+                        version_id, locale, **ver_attrs,
+                    )
+                except RuntimeError as exc:
+                    # Defensive: if the version localization was auto-created
+                    # (or created by a prior interrupted run) between our checks
+                    # and now, adopt and update it instead of failing.
+                    if "already exists" not in str(exc):
+                        raise
+                    loc_id = client.find_app_store_version_localization(version_id, locale)
+                    if loc_id is None:
+                        raise
+                    client.update_app_store_version_localization(loc_id, **ver_attrs)
+
+            (updated_locales if in_snapshot else created_locales).append(locale)
 
     return {"ok": True, "updated_locales": updated_locales, "created_locales": created_locales}
 

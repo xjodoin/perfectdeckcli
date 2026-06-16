@@ -943,9 +943,13 @@ class TestPushListings:
         base_responses = self._setup_push_mocks(client)
         # create_app_info_localization
         create_info = _mock_response(200, {"data": {"id": "new-info-loc"}})
+        # find_app_store_version_localization re-check (no auto-created shell here)
+        recheck_ver = _mock_response(200, {"data": []})
         # create_app_store_version_localization
         create_ver = _mock_response(200, {"data": {"id": "new-ver-loc"}})
-        client.session.request.side_effect = base_responses + [create_info, create_ver]
+        client.session.request.side_effect = base_responses + [
+            create_info, recheck_ver, create_ver,
+        ]
 
         result = push_listings(
             client, "app123", "IOS", "2.0.0",
@@ -953,6 +957,83 @@ class TestPushListings:
         )
         assert result["ok"] is True
         assert "en-US" in result["created_locales"]
+
+    def test_push_new_locale_adopts_auto_created_version_localization(self):
+        """App Store Connect auto-creates the version localization when the
+        app-info localization is created. The push must PATCH that shell rather
+        than POST a duplicate (which previously 409'd and aborted the push)."""
+        client = _mock_client()
+        responses = [
+            # get_app_info_id
+            _mock_response(200, {
+                "data": [{"id": "info-1", "attributes": {"appStoreState": "PREPARE_FOR_SUBMISSION"}}]
+            }),
+            # get_app_store_version_id
+            _mock_response(200, {"data": [{"id": "ver-1"}]}),
+            # list_app_info_localizations (snapshot empty)
+            _mock_response(200, {"data": []}),
+            # list_app_store_version_localizations (snapshot empty)
+            _mock_response(200, {"data": []}),
+            # create_app_info_localization → ASC silently auto-creates the version loc
+            _mock_response(200, {"data": {"id": "new-info-loc"}}),
+            # find_app_store_version_localization re-check finds the auto-created shell
+            _mock_response(200, {
+                "data": [{"id": "auto-ver-loc", "attributes": {"locale": "sk"}}]
+            }),
+            # update_app_store_version_localization (PATCH the shell)
+            _mock_response(200, {}),
+        ]
+        client.session.request.side_effect = responses
+
+        result = push_listings(
+            client, "app123", "IOS", "2.13.0",
+            {"sk": {"app_name": "AI Plant Doctor: Rastliny", "description": "Popis",
+                    "support_url": "https://example.com/support"}},
+        )
+        assert result["ok"] is True
+        # Treated as created (absent from the original snapshot)...
+        assert result["created_locales"] == ["sk"]
+        assert result["updated_locales"] == []
+        # ...but executed as a PATCH of the auto-created shell, with no duplicate POST.
+        calls = client.session.request.call_args_list
+        assert any(c.args[0] == "PATCH" and "auto-ver-loc" in c.args[1] for c in calls)
+        assert not any(
+            c.args[0] == "POST" and c.args[1].endswith("/appStoreVersionLocalizations")
+            for c in calls
+        )
+
+    def test_push_recovers_from_duplicate_version_localization_409(self):
+        """A version localization that already exists but is missing from the
+        snapshot (e.g. left by a prior interrupted run) is adopted via the
+        409 fallback instead of aborting the push."""
+        client = _mock_client()
+        responses = [
+            _mock_response(200, {
+                "data": [{"id": "info-1", "attributes": {"appStoreState": "PREPARE_FOR_SUBMISSION"}}]
+            }),
+            _mock_response(200, {"data": [{"id": "ver-1"}]}),
+            _mock_response(200, {"data": []}),  # list_app_info_localizations
+            _mock_response(200, {"data": []}),  # list_app_store_version_localizations
+            # create_app_store_version_localization → 409 duplicate (no app-info create:
+            # only `description` is supplied, so the pre-check is skipped)
+            _mock_response(409, {}, text='{"errors":[{"detail":"Entity with locale: uk already exists."}]}'),
+            # find_app_store_version_localization fallback
+            _mock_response(200, {
+                "data": [{"id": "existing-ver", "attributes": {"locale": "uk"}}]
+            }),
+            # update_app_store_version_localization
+            _mock_response(200, {}),
+        ]
+        client.session.request.side_effect = responses
+
+        result = push_listings(
+            client, "app123", "IOS", "2.13.0",
+            {"uk": {"description": "Опис"}},
+        )
+        assert result["ok"] is True
+        assert result["created_locales"] == ["uk"]
+        calls = client.session.request.call_args_list
+        assert any(c.args[0] == "PATCH" and "existing-ver" in c.args[1] for c in calls)
 
     def test_push_updates_existing_localizations(self):
         client = _mock_client()
