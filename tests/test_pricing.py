@@ -63,9 +63,25 @@ class TestSnapToPricePoint:
         result = snap_to_price_point(0.01, "USD")
         assert result == PRICE_POINTS["USD"][0]
 
-    def test_above_last_point_snaps_to_last(self):
+    def test_above_last_point_extrapolates_upward(self):
+        # A target above the whole grid must NOT cap at the grid maximum (that
+        # silently under-priced higher-tier products). It extrapolates upward to
+        # a clean .99 ending for fractional currencies.
         result = snap_to_price_point(999.0, "USD")
-        assert result == PRICE_POINTS["USD"][-1]
+        assert result >= 999.0
+        assert result == 999.99
+
+    def test_high_base_is_not_capped_to_grid_max(self):
+        # Regression: base prices above ~$10 used to collapse to the grid max
+        # (e.g. $14.99 and $59.99 both snapped to USD 9.99, EUR 7.99, GBP 6.99).
+        # They must now keep their magnitude.
+        assert snap_to_price_point(14.99, "USD") == 14.99
+        assert snap_to_price_point(59.99, "USD") == 59.99
+        assert snap_to_price_point(14.99, "EUR") == 14.99
+        assert snap_to_price_point(41.99, "GBP") == 41.99
+        # Whole-number currencies extrapolate to a tidy step, not an arbitrary ceil.
+        assert snap_to_price_point(6659, "JPY") == 6700.0
+        assert snap_to_price_point(1743, "INR") == 1800.0
 
     def test_known_currencies(self):
         for currency in ["EUR", "GBP", "CAD", "AUD", "INR", "JPY", "KRW"]:
@@ -80,10 +96,19 @@ class TestSnapToPricePoint:
         result = snap_to_price_point(7.36, "XOF")
         assert result == 8.0
 
-    def test_result_is_always_a_valid_point(self):
-        for price in [0.5, 1.0, 2.5, 5.0, 9.99, 15.0]:
+    def test_in_grid_prices_snap_to_a_valid_point(self):
+        # Within the grid's range, results are always a defined grid point.
+        for price in [0.5, 1.0, 2.5, 5.0, 7.99]:
             result = snap_to_price_point(price, "EUR")
             assert result in PRICE_POINTS["EUR"]
+
+    def test_above_grid_prices_extrapolate_not_cap(self):
+        # Above the grid, results extend upward instead of capping at the max.
+        eur_max = max(PRICE_POINTS["EUR"])
+        for price in [15.0, 49.99, 120.0]:
+            result = snap_to_price_point(price, "EUR")
+            assert result > eur_max
+            assert result >= price
 
 
 # ===========================================================================

@@ -179,6 +179,25 @@ def _round_up_to_99(price: float) -> float:
     return round(candidate, 2)
 
 
+def _round_up_to_nice_whole(price: float) -> float:
+    """Round a whole-number-currency price up to a clean magnitude step.
+
+    Used when a target exceeds a currency's defined price grid (or the currency
+    has no grid): keeps values tidy (e.g. ¥6659 → ¥6700, ₹1743 → ₹1800) instead
+    of emitting an arbitrary ceiling.
+    """
+    if price <= 0:
+        return 0.0
+    whole = math.ceil(price)
+    if whole >= 1000:
+        step = 100
+    elif whole >= 100:
+        step = 10
+    else:
+        return float(whole)
+    return float(((whole + step - 1) // step) * step)
+
+
 def fetch_live_rates(timeout: float = _FETCH_TIMEOUT) -> dict[str, float]:
     """Fetch current USD-based exchange rates from open.er-api.com.
 
@@ -311,7 +330,14 @@ def snap_to_price_point(price: float, currency: str) -> float:
             return ordered[0]
         upward = [p for p in ordered if p >= price]
         if not upward:
-            return ordered[-1]
+            # Target is above every point in the grid. Do NOT cap at the grid
+            # maximum — that silently under-prices higher-tier products (e.g. an
+            # annual subscription priced like a monthly one). Extrapolate upward
+            # to a clean ending that matches the currency's convention: whole
+            # numbers for integer/zero-decimal grids, ``.99`` otherwise.
+            if currency in ZERO_DECIMAL_CURRENCIES or all(p == int(p) for p in ordered):
+                return _round_up_to_nice_whole(price)
+            return _round_up_to_99(price)
         ninety_nine = [
             p for p in upward if int(round((p - int(p)) * 100)) == 99
         ]
@@ -321,7 +347,7 @@ def snap_to_price_point(price: float, currency: str) -> float:
     # For currencies without a defined price grid, avoid falling back to USD points
     # (which gives wrong magnitudes). Keep no-cent currencies whole-number only.
     if currency in ZERO_DECIMAL_CURRENCIES:
-        return float(max(0, math.ceil(price)))
+        return _round_up_to_nice_whole(price)
     return _round_up_to_99(price)
 
 
