@@ -135,10 +135,24 @@ class AppStoreConnectClient:
                 "Requesting %s %s (attempt %s/%s)",
                 method_upper, path, attempt, max_attempts,
             )
-            response = self.session.request(
-                method_upper, url, params=params, json=json_body,
-                headers=headers, timeout=30,
-            )
+            try:
+                response = self.session.request(
+                    method_upper, url, params=params, json=json_body,
+                    headers=headers, timeout=30,
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                safe_to_retry = method_upper in {"GET", "PATCH"}
+                if safe_to_retry and attempt < max_attempts:
+                    wait_seconds = 1.0 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                    self.logger.warning(
+                        "Network error for %s %s. Retrying in %.2fs (attempt %s/%s): %s",
+                        method_upper, path, wait_seconds, attempt, max_attempts, exc,
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise RuntimeError(
+                    f"App Store Connect network error for {method_upper} {path}: {exc}"
+                ) from exc
             status = response.status_code
             self.logger.debug("Received %s %s status=%s", method_upper, path, status)
 
@@ -200,9 +214,22 @@ class AppStoreConnectClient:
         attempt = 0
         while True:
             attempt += 1
-            response = self.session.request(
-                method_upper, url, params=params, headers=headers, timeout=60,
-            )
+            try:
+                response = self.session.request(
+                    method_upper, url, params=params, headers=headers, timeout=60,
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if method_upper == "GET" and attempt < max_attempts:
+                    wait_seconds = 1.0 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                    self.logger.warning(
+                        "Network error for %s %s. Retrying in %.2fs (attempt %s/%s): %s",
+                        method_upper, path, wait_seconds, attempt, max_attempts, exc,
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise RuntimeError(
+                    f"App Store Connect network error for {method_upper} {path}: {exc}"
+                ) from exc
             status = response.status_code
             if status < 400:
                 return response.content

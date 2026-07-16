@@ -6,6 +6,7 @@ import gzip
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from perfectdeckcli.app_store import (
     VALID_DISPLAY_TYPES,
@@ -134,6 +135,24 @@ class TestClientRequest:
         result = client.request("GET", "/flaky")
         assert result == {"data": "ok"}
         assert client.session.request.call_count == 3
+
+    @patch("time.sleep")
+    @patch("random.uniform", return_value=0.1)
+    def test_retries_get_after_read_timeout(self, mock_rand, mock_sleep):
+        client = _mock_client()
+        success = _mock_response(200, {"data": "ok"})
+        client.session.request.side_effect = [requests.exceptions.ReadTimeout(), success]
+        result = client.request("GET", "/slow")
+        assert result == {"data": "ok"}
+        assert client.session.request.call_count == 2
+
+    @patch("time.sleep")
+    def test_does_not_retry_post_after_read_timeout(self, mock_sleep):
+        client = _mock_client()
+        client.session.request.side_effect = requests.exceptions.ReadTimeout("slow")
+        with pytest.raises(RuntimeError, match="network error"):
+            client.request("POST", "/create")
+        assert client.session.request.call_count == 1
 
     @patch("time.sleep")
     def test_does_not_retry_post_on_transient_error(self, mock_sleep):
