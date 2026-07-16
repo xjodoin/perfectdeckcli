@@ -1118,6 +1118,26 @@ class TestPushAppStoreScreenshotsTool:
 
 
 class TestSyncAppStoreIapTool:
+    def test_local_product_conversion_preserves_creation_metadata(self):
+        products = mcp_server._local_products_to_app_store_list({
+            "credits": {
+                "type": "consumable",
+                "name": "10 Credits",
+                "review_note": "Grants 10 credits.",
+                "family_sharable": False,
+                "localizations": {"en-US": {"name": "10 Credits"}},
+            },
+        })
+
+        assert products == [{
+            "product_id": "credits",
+            "localizations": {"en-US": {"name": "10 Credits"}},
+            "type": "consumable",
+            "name": "10 Credits",
+            "review_note": "Grants 10 credits.",
+            "family_sharable": False,
+        }]
+
     @patch("perfectdeckcli.mcp_server.app_store_api.sync_iap_localizations")
     @patch("perfectdeckcli.mcp_server.app_store_api.AppStoreConnectClient.from_key_file")
     def test_sync_iap(self, mock_from_key, mock_sync, tmp_path):

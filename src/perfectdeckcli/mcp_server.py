@@ -835,7 +835,10 @@ class SyncAppStoreIapInput(BaseModel):
     products: list[dict[str, Any]] | None = Field(
         default=None,
         description=(
-            "List of {product_id, localizations: {locale: {name, description}}}. "
+            "List of {product_id, type, localizations: {locale: {name, description}}, pricing}. "
+            "A missing product is created when type is consumable, non_consumable, or "
+            "non_renewing_subscription; optional creation fields are name, review_note, "
+            "and family_sharable. "
             "When omitted and app is provided, products are auto-loaded from the local listing."
         ),
     )
@@ -3846,14 +3849,16 @@ def _local_products_to_app_store_list(products: dict[str, Any]) -> list[dict[str
             entry["localizations"] = cfg["localizations"]
         if "pricing" in cfg:
             entry["pricing"] = cfg["pricing"]
-        # Creation metadata (App Store subscriptions): passed through so a
-        # missing subscription can be created during sync.
+        # Creation metadata: passed through so missing IAPs and subscriptions
+        # can be created during sync.
         for key in (
+            "type",
             "group_name",
             "subscription_period",
             "group_level",
             "family_sharable",
             "name",
+            "review_note",
         ):
             if key in cfg:
                 entry[key] = cfg[key]
@@ -4044,11 +4049,12 @@ def perfectdeck_get_pricing_tiers() -> str:
     },
 )
 def perfectdeck_sync_app_store_iap(params: SyncAppStoreIapInput) -> str:
-    """Sync in-app purchase localizations and pricing to App Store Connect.
+    """Create and/or sync in-app purchases, localizations, and pricing.
 
     When products is omitted, all products from the local listing are synced automatically.
+    Missing products are created when their local config includes ``type``.
     Set delete_missing=true to remove remote localizations not present in the local listing.
-    Products that have a ``pricing`` field will have their regional pricing pushed automatically.
+    Products with pricing also get territory availability before pricing is pushed.
     """
     if params.app:
         r_app_id, r_key_id, r_issuer_id, r_pk = _resolve_app_store_credentials(

@@ -1563,9 +1563,11 @@ class AppStoreConnectClient:
         nearest valid point per territory, then POSTs a new price schedule
         (which replaces any existing one for this IAP).
 
-        Returns ``{"territories_set": int, "territories_skipped": [...], "not_found": [...]}``.
+        Returns the number of territories set, any skipped territories, and
+        whether pricing initialization also created the IAP availability.
         """
         territories = list(pricing.keys())
+        availability = self.ensure_iap_availability(iap_id, territories)
         price_points = self._fetch_price_points_paginated(
             f"/v2/inAppPurchases/{iap_id}/pricePoints",
             territories=territories,
@@ -1596,7 +1598,11 @@ class AppStoreConnectClient:
             })
 
         if not included:
-            return {"territories_set": 0, "territories_skipped": not_found}
+            return {
+                "territories_set": 0,
+                "territories_skipped": not_found,
+                "availability_created": availability["created"],
+            }
 
         self.request(
             "POST",
@@ -1617,7 +1623,11 @@ class AppStoreConnectClient:
                 "included": included,
             },
         )
-        return {"territories_set": len(included), "territories_skipped": not_found}
+        return {
+            "territories_set": len(included),
+            "territories_skipped": not_found,
+            "availability_created": availability["created"],
+        }
 
     def set_subscription_pricing(
         self,
@@ -1786,6 +1796,140 @@ class AppStoreConnectClient:
         if items:
             return items[0]["id"]
         return None
+
+    def create_in_app_purchase(
+        self,
+        app_id: str,
+        product_id: str,
+        name: str,
+        in_app_purchase_type: str,
+        *,
+        family_sharable: bool = False,
+        review_note: str | None = None,
+    ) -> str:
+        """Create a consumable, non-consumable, or non-renewing IAP."""
+        normalized_type = str(in_app_purchase_type).strip().upper()
+        aliases = {
+            "NONCONSUMABLE": "NON_CONSUMABLE",
+            "NONRENEWING_SUBSCRIPTION": "NON_RENEWING_SUBSCRIPTION",
+        }
+        normalized_type = aliases.get(normalized_type, normalized_type)
+        supported = {
+            "CONSUMABLE",
+            "NON_CONSUMABLE",
+            "NON_RENEWING_SUBSCRIPTION",
+        }
+        if normalized_type not in supported:
+            raise ValueError(
+                f"Unsupported App Store IAP type: {in_app_purchase_type!r}. "
+                f"Expected one of: {', '.join(sorted(supported))}."
+            )
+
+        attributes: Dict[str, Any] = {
+            "name": str(name)[:64],
+            "productId": product_id,
+            "inAppPurchaseType": normalized_type,
+            "familySharable": family_sharable,
+        }
+        if review_note is not None:
+            attributes["reviewNote"] = review_note
+        data = self.request(
+            "POST",
+            "/v2/inAppPurchases",
+            json_body={
+                "data": {
+                    "type": "inAppPurchases",
+                    "attributes": attributes,
+                    "relationships": {
+                        "app": {"data": {"type": "apps", "id": app_id}},
+                    },
+                },
+            },
+        )
+        return data.get("data", {}).get("id", "")
+
+    def get_iap_availability(self, iap_id: str) -> Dict[str, Any] | None:
+        """Return an IAP's availability, or ``None`` when it is unset."""
+        try:
+            data = self.request(
+                "GET",
+                f"/v2/inAppPurchases/{iap_id}/inAppPurchaseAvailability",
+            )
+        except RuntimeError as exc:
+            if "404" in str(exc):
+                return None
+            raise
+
+        availability = data.get("data", {})
+        availability_id = availability.get("id") or iap_id
+        territories: set[str] = set()
+        base_domain = self.base_url.rsplit("/v", 1)[0]
+        next_path: str | None = (
+            f"/v1/inAppPurchaseAvailabilities/{availability_id}/availableTerritories"
+        )
+        next_params: Dict[str, str] | None = {"limit": "200"}
+        while next_path:
+            response = self.request("GET", next_path, params=next_params)
+            territories.update(
+                item["id"] for item in response.get("data", []) if item.get("id")
+            )
+            next_link = response.get("links", {}).get("next")
+            if (
+                next_link
+                and isinstance(next_link, str)
+                and next_link.startswith(base_domain)
+            ):
+                next_path = next_link[len(base_domain):]
+                next_params = None
+            else:
+                next_path = None
+        return {
+            "available_in_new_territories": availability
+            .get("attributes", {})
+            .get("availableInNewTerritories", True),
+            "territories": territories,
+        }
+
+    def ensure_iap_availability(
+        self,
+        iap_id: str,
+        territories: Sequence[str],
+        *,
+        available_in_new_territories: bool = True,
+    ) -> Dict[str, Any]:
+        """Create IAP territory availability when none exists."""
+        existing = self.get_iap_availability(iap_id)
+        if existing is not None:
+            return {
+                "created": False,
+                "available_territories": existing["territories"],
+            }
+
+        wanted = [territory for territory in dict.fromkeys(territories) if territory]
+        self.request(
+            "POST",
+            "/v1/inAppPurchaseAvailabilities",
+            json_body={
+                "data": {
+                    "type": "inAppPurchaseAvailabilities",
+                    "attributes": {
+                        "availableInNewTerritories": available_in_new_territories,
+                    },
+                    "relationships": {
+                        "availableTerritories": {
+                            "data": [
+                                {"type": "territories", "id": territory}
+                                for territory in wanted
+                            ],
+                        },
+                        "inAppPurchase": {
+                            "data": {"type": "inAppPurchases", "id": iap_id},
+                        },
+                    },
+                },
+            },
+        )
+        return {"created": True, "available_territories": set(wanted)}
 
     def list_in_app_purchase_localizations(
         self, iap_id: str,
@@ -2673,21 +2817,26 @@ def sync_iap_localizations(
     When *delete_missing* is True, remote localizations not present in the
     local list are deleted from App Store Connect.
 
-    Returns ``{"ok": True, "created": int, "updated": int, "deleted": int, "missing_products": [...]}``.
+    Missing products are created when their config includes ``type``. Returns
+    ``{"ok": True, "created": int, "updated": int, "deleted": int,
+    "created_products": [...], "missing_products": [...]}``.
     """
     created_count = 0
     updated_count = 0
     deleted_count = 0
     missing: List[str] = []
+    created_products: List[str] = []
 
     for product in products:
         product_id = product["product_id"]
         localizations = product.get("localizations", {})
 
-        iap_id = client.find_in_app_purchase_id(app_id, product_id)
+        iap_id, was_created = ensure_iap_exists(client, app_id, product)
         if iap_id is None:
             missing.append(product_id)
             continue
+        if was_created:
+            created_products.append(product_id)
 
         existing = client.list_in_app_purchase_localizations(iap_id)
 
@@ -2718,8 +2867,44 @@ def sync_iap_localizations(
         "created": created_count,
         "updated": updated_count,
         "deleted": deleted_count,
+        "created_products": created_products,
         "missing_products": missing,
     }
+
+
+def ensure_iap_exists(
+    client: AppStoreConnectClient,
+    app_id: str,
+    product: Dict[str, Any],
+) -> tuple[str | None, bool]:
+    """Find an IAP by product id, creating it when ``type`` is configured."""
+    product_id = product.get("product_id", "")
+    iap_id = client.find_in_app_purchase_id(app_id, product_id)
+    if iap_id is not None:
+        return iap_id, False
+
+    product_type = product.get("type") or product.get("in_app_purchase_type")
+    if not product_type:
+        return None, False
+
+    name = product.get("name")
+    if not name:
+        localizations = product.get("localizations", {}) or {}
+        chosen = (
+            localizations.get("en-US")
+            or (next(iter(localizations.values()), {}) if localizations else {})
+        )
+        name = (chosen or {}).get("name") or product_id.rsplit(".", 1)[-1]
+
+    new_id = client.create_in_app_purchase(
+        app_id,
+        product_id,
+        str(name),
+        str(product_type),
+        family_sharable=bool(product.get("family_sharable", False)),
+        review_note=product.get("review_note"),
+    )
+    return new_id, True
 
 
 def ensure_subscription_exists(
@@ -2882,7 +3067,7 @@ def sync_iap_pricing(
         if not pricing:
             continue
 
-        iap_id = client.find_in_app_purchase_id(app_id, product_id)
+        iap_id, _ = ensure_iap_exists(client, app_id, product)
         if iap_id is None:
             missing.append(product_id)
             continue

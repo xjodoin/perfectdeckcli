@@ -711,6 +711,62 @@ class TestIAPManagement:
         result = client.find_in_app_purchase_id("app123", "com.example.missing")
         assert result is None
 
+    def test_create_iap(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(201, {
+            "data": {"id": "iap-new"},
+        })
+
+        result = client.create_in_app_purchase(
+            "app123",
+            "com.example.credits",
+            "10 Credits",
+            "consumable",
+            review_note="Grants 10 credits.",
+        )
+
+        assert result == "iap-new"
+        request = client.session.request.call_args
+        assert request.args[:2] == ("POST", "https://api.appstoreconnect.apple.com/v2/inAppPurchases")
+        data = request.kwargs["json"]["data"]
+        assert data["attributes"] == {
+            "name": "10 Credits",
+            "productId": "com.example.credits",
+            "inAppPurchaseType": "CONSUMABLE",
+            "familySharable": False,
+            "reviewNote": "Grants 10 credits.",
+        }
+        assert data["relationships"]["app"]["data"]["id"] == "app123"
+
+    def test_set_iap_pricing_creates_availability(self):
+        client = _mock_client()
+        client.session.request.side_effect = [
+            _mock_response(404, text="not found"),
+            _mock_response(201, {"data": {"id": "iap-1"}}),
+            _mock_response(200, {
+                "data": [{
+                    "id": "pp-usa",
+                    "attributes": {"customerPrice": "4.99"},
+                    "relationships": {
+                        "territory": {"data": {"type": "territories", "id": "USA"}},
+                    },
+                }],
+                "included": [],
+                "links": {},
+            }),
+            _mock_response(201, {"data": {"id": "schedule-1"}}),
+        ]
+
+        result = client.set_iap_pricing(
+            "iap-1",
+            {"USA": {"currency": "USD", "price": 4.99}},
+        )
+
+        assert result["availability_created"] is True
+        assert result["territories_set"] == 1
+        availability_request = client.session.request.call_args_list[1]
+        assert availability_request.args[1].endswith("/v1/inAppPurchaseAvailabilities")
+
     def test_list_iap_localizations(self):
         client = _mock_client()
         client.session.request.return_value = _mock_response(200, {
@@ -1213,6 +1269,27 @@ class TestSyncIapLocalizations:
             {"product_id": "missing", "localizations": {"en-US": {"name": "X"}}},
         ])
         assert result["missing_products"] == ["missing"]
+
+    def test_missing_product_is_created_when_type_is_configured(self):
+        client = _mock_client()
+        client.session.request.side_effect = [
+            _mock_response(200, {"data": []}),
+            _mock_response(201, {"data": {"id": "iap-new"}}),
+            _mock_response(200, {"data": []}),
+            _mock_response(201, {"data": {"id": "loc-new"}}),
+        ]
+
+        result = sync_iap_localizations(client, "app123", [{
+            "product_id": "credits",
+            "type": "consumable",
+            "localizations": {
+                "en-US": {"name": "10 Credits", "description": "Buy 10"},
+            },
+        }])
+
+        assert result["created_products"] == ["credits"]
+        assert result["missing_products"] == []
+        assert result["created"] == 1
 
 
 # ======================================================================
