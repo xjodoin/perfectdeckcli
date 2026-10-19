@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
+from urllib.parse import urlparse
 
 import jwt
 import requests
@@ -205,10 +206,12 @@ class AppStoreConnectClient:
         else:
             url = f"{self.base_url}{path}"
         method_upper = (method or "GET").upper()
-        headers = {
-            "Authorization": self._authorization_header(),
-            "Accept": accept,
-        }
+        headers = {"Accept": accept}
+        # Analytics segment URLs are pre-signed S3 links: S3 rejects a second
+        # auth mechanism (400 "Only one auth mechanism allowed"), so the bearer
+        # token only goes to the App Store Connect API host.
+        if urlparse(url).hostname == urlparse(self.base_url).hostname:
+            headers["Authorization"] = self._authorization_header()
 
         max_attempts = 4
         attempt = 0

@@ -248,6 +248,9 @@ class TestReportsAndAnalytics:
         result = client.download_analytics_report_segment("seg-1")
         assert result == b"segment-bytes"
         assert client.session.request.call_args.args[1] == "https://example.com/segment.gz"
+        assert "Authorization" not in client.session.request.call_args.kwargs["headers"]
+        # The metadata lookup itself still goes to the API with the bearer token.
+        assert "Authorization" in client.session.request.call_args_list[0].kwargs["headers"]
 
 
 class TestCustomProductPagesAndExperiments:
