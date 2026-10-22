@@ -6,6 +6,7 @@ import gzip
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from perfectdeckcli.app_store import (
     VALID_DISPLAY_TYPES,
@@ -136,6 +137,24 @@ class TestClientRequest:
         assert client.session.request.call_count == 3
 
     @patch("time.sleep")
+    @patch("random.uniform", return_value=0.1)
+    def test_retries_get_after_read_timeout(self, mock_rand, mock_sleep):
+        client = _mock_client()
+        success = _mock_response(200, {"data": "ok"})
+        client.session.request.side_effect = [requests.exceptions.ReadTimeout(), success]
+        result = client.request("GET", "/slow")
+        assert result == {"data": "ok"}
+        assert client.session.request.call_count == 2
+
+    @patch("time.sleep")
+    def test_does_not_retry_post_after_read_timeout(self, mock_sleep):
+        client = _mock_client()
+        client.session.request.side_effect = requests.exceptions.ReadTimeout("slow")
+        with pytest.raises(RuntimeError, match="network error"):
+            client.request("POST", "/create")
+        assert client.session.request.call_count == 1
+
+    @patch("time.sleep")
     def test_does_not_retry_post_on_transient_error(self, mock_sleep):
         client = _mock_client()
         client.session.request.return_value = _mock_response(500, text="Server Error")
@@ -229,6 +248,9 @@ class TestReportsAndAnalytics:
         result = client.download_analytics_report_segment("seg-1")
         assert result == b"segment-bytes"
         assert client.session.request.call_args.args[1] == "https://example.com/segment.gz"
+        assert "Authorization" not in client.session.request.call_args.kwargs["headers"]
+        # The metadata lookup itself still goes to the API with the bearer token.
+        assert "Authorization" in client.session.request.call_args_list[0].kwargs["headers"]
 
 
 class TestCustomProductPagesAndExperiments:
@@ -711,6 +733,62 @@ class TestIAPManagement:
         result = client.find_in_app_purchase_id("app123", "com.example.missing")
         assert result is None
 
+    def test_create_iap(self):
+        client = _mock_client()
+        client.session.request.return_value = _mock_response(201, {
+            "data": {"id": "iap-new"},
+        })
+
+        result = client.create_in_app_purchase(
+            "app123",
+            "com.example.credits",
+            "10 Credits",
+            "consumable",
+            review_note="Grants 10 credits.",
+        )
+
+        assert result == "iap-new"
+        request = client.session.request.call_args
+        assert request.args[:2] == ("POST", "https://api.appstoreconnect.apple.com/v2/inAppPurchases")
+        data = request.kwargs["json"]["data"]
+        assert data["attributes"] == {
+            "name": "10 Credits",
+            "productId": "com.example.credits",
+            "inAppPurchaseType": "CONSUMABLE",
+            "familySharable": False,
+            "reviewNote": "Grants 10 credits.",
+        }
+        assert data["relationships"]["app"]["data"]["id"] == "app123"
+
+    def test_set_iap_pricing_creates_availability(self):
+        client = _mock_client()
+        client.session.request.side_effect = [
+            _mock_response(404, text="not found"),
+            _mock_response(201, {"data": {"id": "iap-1"}}),
+            _mock_response(200, {
+                "data": [{
+                    "id": "pp-usa",
+                    "attributes": {"customerPrice": "4.99"},
+                    "relationships": {
+                        "territory": {"data": {"type": "territories", "id": "USA"}},
+                    },
+                }],
+                "included": [],
+                "links": {},
+            }),
+            _mock_response(201, {"data": {"id": "schedule-1"}}),
+        ]
+
+        result = client.set_iap_pricing(
+            "iap-1",
+            {"USA": {"currency": "USD", "price": 4.99}},
+        )
+
+        assert result["availability_created"] is True
+        assert result["territories_set"] == 1
+        availability_request = client.session.request.call_args_list[1]
+        assert availability_request.args[1].endswith("/v1/inAppPurchaseAvailabilities")
+
     def test_list_iap_localizations(self):
         client = _mock_client()
         client.session.request.return_value = _mock_response(200, {
@@ -943,9 +1021,13 @@ class TestPushListings:
         base_responses = self._setup_push_mocks(client)
         # create_app_info_localization
         create_info = _mock_response(200, {"data": {"id": "new-info-loc"}})
+        # find_app_store_version_localization re-check (no auto-created shell here)
+        recheck_ver = _mock_response(200, {"data": []})
         # create_app_store_version_localization
         create_ver = _mock_response(200, {"data": {"id": "new-ver-loc"}})
-        client.session.request.side_effect = base_responses + [create_info, create_ver]
+        client.session.request.side_effect = base_responses + [
+            create_info, recheck_ver, create_ver,
+        ]
 
         result = push_listings(
             client, "app123", "IOS", "2.0.0",
@@ -953,6 +1035,83 @@ class TestPushListings:
         )
         assert result["ok"] is True
         assert "en-US" in result["created_locales"]
+
+    def test_push_new_locale_adopts_auto_created_version_localization(self):
+        """App Store Connect auto-creates the version localization when the
+        app-info localization is created. The push must PATCH that shell rather
+        than POST a duplicate (which previously 409'd and aborted the push)."""
+        client = _mock_client()
+        responses = [
+            # get_app_info_id
+            _mock_response(200, {
+                "data": [{"id": "info-1", "attributes": {"appStoreState": "PREPARE_FOR_SUBMISSION"}}]
+            }),
+            # get_app_store_version_id
+            _mock_response(200, {"data": [{"id": "ver-1"}]}),
+            # list_app_info_localizations (snapshot empty)
+            _mock_response(200, {"data": []}),
+            # list_app_store_version_localizations (snapshot empty)
+            _mock_response(200, {"data": []}),
+            # create_app_info_localization → ASC silently auto-creates the version loc
+            _mock_response(200, {"data": {"id": "new-info-loc"}}),
+            # find_app_store_version_localization re-check finds the auto-created shell
+            _mock_response(200, {
+                "data": [{"id": "auto-ver-loc", "attributes": {"locale": "sk"}}]
+            }),
+            # update_app_store_version_localization (PATCH the shell)
+            _mock_response(200, {}),
+        ]
+        client.session.request.side_effect = responses
+
+        result = push_listings(
+            client, "app123", "IOS", "2.13.0",
+            {"sk": {"app_name": "AI Plant Doctor: Rastliny", "description": "Popis",
+                    "support_url": "https://example.com/support"}},
+        )
+        assert result["ok"] is True
+        # Treated as created (absent from the original snapshot)...
+        assert result["created_locales"] == ["sk"]
+        assert result["updated_locales"] == []
+        # ...but executed as a PATCH of the auto-created shell, with no duplicate POST.
+        calls = client.session.request.call_args_list
+        assert any(c.args[0] == "PATCH" and "auto-ver-loc" in c.args[1] for c in calls)
+        assert not any(
+            c.args[0] == "POST" and c.args[1].endswith("/appStoreVersionLocalizations")
+            for c in calls
+        )
+
+    def test_push_recovers_from_duplicate_version_localization_409(self):
+        """A version localization that already exists but is missing from the
+        snapshot (e.g. left by a prior interrupted run) is adopted via the
+        409 fallback instead of aborting the push."""
+        client = _mock_client()
+        responses = [
+            _mock_response(200, {
+                "data": [{"id": "info-1", "attributes": {"appStoreState": "PREPARE_FOR_SUBMISSION"}}]
+            }),
+            _mock_response(200, {"data": [{"id": "ver-1"}]}),
+            _mock_response(200, {"data": []}),  # list_app_info_localizations
+            _mock_response(200, {"data": []}),  # list_app_store_version_localizations
+            # create_app_store_version_localization → 409 duplicate (no app-info create:
+            # only `description` is supplied, so the pre-check is skipped)
+            _mock_response(409, {}, text='{"errors":[{"detail":"Entity with locale: uk already exists."}]}'),
+            # find_app_store_version_localization fallback
+            _mock_response(200, {
+                "data": [{"id": "existing-ver", "attributes": {"locale": "uk"}}]
+            }),
+            # update_app_store_version_localization
+            _mock_response(200, {}),
+        ]
+        client.session.request.side_effect = responses
+
+        result = push_listings(
+            client, "app123", "IOS", "2.13.0",
+            {"uk": {"description": "Опис"}},
+        )
+        assert result["ok"] is True
+        assert result["created_locales"] == ["uk"]
+        calls = client.session.request.call_args_list
+        assert any(c.args[0] == "PATCH" and "existing-ver" in c.args[1] for c in calls)
 
     def test_push_updates_existing_localizations(self):
         client = _mock_client()
@@ -1132,6 +1291,27 @@ class TestSyncIapLocalizations:
             {"product_id": "missing", "localizations": {"en-US": {"name": "X"}}},
         ])
         assert result["missing_products"] == ["missing"]
+
+    def test_missing_product_is_created_when_type_is_configured(self):
+        client = _mock_client()
+        client.session.request.side_effect = [
+            _mock_response(200, {"data": []}),
+            _mock_response(201, {"data": {"id": "iap-new"}}),
+            _mock_response(200, {"data": []}),
+            _mock_response(201, {"data": {"id": "loc-new"}}),
+        ]
+
+        result = sync_iap_localizations(client, "app123", [{
+            "product_id": "credits",
+            "type": "consumable",
+            "localizations": {
+                "en-US": {"name": "10 Credits", "description": "Buy 10"},
+            },
+        }])
+
+        assert result["created_products"] == ["credits"]
+        assert result["missing_products"] == []
+        assert result["created"] == 1
 
 
 # ======================================================================

@@ -907,6 +907,24 @@ class TestEnsureManagedProducts:
         assert result["ok"] is True
         assert result["created"] == ["credits_3"]
         assert result["updated"] == []
+        assert result["activated"] == ["credits_3"]
+        activate = (
+            monetization.onetimeproducts.return_value.purchaseOptions.return_value
+            .batchUpdateStates
+        )
+        activate.assert_called_once()
+        request = activate.call_args.kwargs
+        assert request["packageName"] == "com.example.app"
+        assert request["productId"] == "credits_3"
+        assert request["body"] == {
+            "requests": [{
+                "activatePurchaseOptionRequest": {
+                    "packageName": "com.example.app",
+                    "productId": "credits_3",
+                    "purchaseOptionId": "default",
+                },
+            }],
+        }
 
     def test_update_existing_product(self):
         svc = _mock_service()
@@ -920,6 +938,29 @@ class TestEnsureManagedProducts:
         assert result["ok"] is True
         assert result["updated"] == ["credits_3"]
         assert result["created"] == []
+
+    def test_active_default_purchase_option_is_not_reactivated(self):
+        svc = _mock_service()
+        monetization = svc.monetization.return_value
+        monetization.onetimeproducts.return_value.get.return_value.execute.return_value = {
+            "purchaseOptions": [{
+                "purchaseOptionId": "default",
+                "state": "ACTIVE",
+                "regionalPricingAndAvailabilityConfigs": [],
+            }],
+        }
+
+        result = ensure_managed_products(svc, "com.example.app", [{
+            "sku": "credits_3",
+            "pricing": {"US": {"currency": "USD", "price": 2.99}},
+            "listings": {"en-US": {"title": "3 Credits"}},
+        }])
+
+        assert result["activated"] == []
+        (
+            monetization.onetimeproducts.return_value.purchaseOptions.return_value
+            .batchUpdateStates.assert_not_called()
+        )
 
     def test_multiple_products(self):
         svc = _mock_service()

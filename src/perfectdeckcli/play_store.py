@@ -1389,11 +1389,13 @@ def ensure_managed_products(
             }
         }
 
-    Returns ``{"ok": True, "created": [...], "updated": [...], "pricing_applied": {...}}``.
+    Returns creation/update results plus the products whose default purchase
+    option was activated and made sellable.
     """
     monetization = service.monetization()
     created: List[str] = []
     updated: List[str] = []
+    activated: List[str] = []
     pricing_applied: Dict[str, int] = {}
 
     for product in products:
@@ -1463,6 +1465,12 @@ def ensure_managed_products(
                 new_by_region,
             )
 
+            default_is_active = any(
+                option.get("purchaseOptionId") == "default"
+                and option.get("state") == "ACTIVE"
+                for option in existing_pos
+            )
+
         # patch() with allowMissing=True is an upsert — creates or updates
         _execute_with_retry(
             monetization.onetimeproducts().patch(
@@ -1471,6 +1479,23 @@ def ensure_managed_products(
                 regionsVersion_version="2025/03",
             )
         )
+        if regional_configs and not default_is_active:
+            _execute_with_retry(
+                monetization.onetimeproducts().purchaseOptions().batchUpdateStates(
+                    packageName=package_name,
+                    productId=sku,
+                    body={
+                        "requests": [{
+                            "activatePurchaseOptionRequest": {
+                                "packageName": package_name,
+                                "productId": sku,
+                                "purchaseOptionId": "default",
+                            },
+                        }],
+                    },
+                )
+            )
+            activated.append(sku)
         if product_exists:
             updated.append(sku)
         else:
@@ -1478,7 +1503,13 @@ def ensure_managed_products(
         if regional_configs:
             pricing_applied[sku] = len(regional_configs)
 
-    return {"ok": True, "created": created, "updated": updated, "pricing_applied": pricing_applied}
+    return {
+        "ok": True,
+        "created": created,
+        "updated": updated,
+        "activated": activated,
+        "pricing_applied": pricing_applied,
+    }
 
 
 # ---------------------------------------------------------------------------

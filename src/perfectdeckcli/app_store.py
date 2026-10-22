@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
+from urllib.parse import urlparse
 
 import jwt
 import requests
@@ -135,10 +136,24 @@ class AppStoreConnectClient:
                 "Requesting %s %s (attempt %s/%s)",
                 method_upper, path, attempt, max_attempts,
             )
-            response = self.session.request(
-                method_upper, url, params=params, json=json_body,
-                headers=headers, timeout=30,
-            )
+            try:
+                response = self.session.request(
+                    method_upper, url, params=params, json=json_body,
+                    headers=headers, timeout=30,
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                safe_to_retry = method_upper in {"GET", "PATCH"}
+                if safe_to_retry and attempt < max_attempts:
+                    wait_seconds = 1.0 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                    self.logger.warning(
+                        "Network error for %s %s. Retrying in %.2fs (attempt %s/%s): %s",
+                        method_upper, path, wait_seconds, attempt, max_attempts, exc,
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise RuntimeError(
+                    f"App Store Connect network error for {method_upper} {path}: {exc}"
+                ) from exc
             status = response.status_code
             self.logger.debug("Received %s %s status=%s", method_upper, path, status)
 
@@ -191,18 +206,33 @@ class AppStoreConnectClient:
         else:
             url = f"{self.base_url}{path}"
         method_upper = (method or "GET").upper()
-        headers = {
-            "Authorization": self._authorization_header(),
-            "Accept": accept,
-        }
+        headers = {"Accept": accept}
+        # Analytics segment URLs are pre-signed S3 links: S3 rejects a second
+        # auth mechanism (400 "Only one auth mechanism allowed"), so the bearer
+        # token only goes to the App Store Connect API host.
+        if urlparse(url).hostname == urlparse(self.base_url).hostname:
+            headers["Authorization"] = self._authorization_header()
 
         max_attempts = 4
         attempt = 0
         while True:
             attempt += 1
-            response = self.session.request(
-                method_upper, url, params=params, headers=headers, timeout=60,
-            )
+            try:
+                response = self.session.request(
+                    method_upper, url, params=params, headers=headers, timeout=60,
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if method_upper == "GET" and attempt < max_attempts:
+                    wait_seconds = 1.0 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                    self.logger.warning(
+                        "Network error for %s %s. Retrying in %.2fs (attempt %s/%s): %s",
+                        method_upper, path, wait_seconds, attempt, max_attempts, exc,
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise RuntimeError(
+                    f"App Store Connect network error for {method_upper} {path}: {exc}"
+                ) from exc
             status = response.status_code
             if status < 400:
                 return response.content
@@ -1563,9 +1593,11 @@ class AppStoreConnectClient:
         nearest valid point per territory, then POSTs a new price schedule
         (which replaces any existing one for this IAP).
 
-        Returns ``{"territories_set": int, "territories_skipped": [...], "not_found": [...]}``.
+        Returns the number of territories set, any skipped territories, and
+        whether pricing initialization also created the IAP availability.
         """
         territories = list(pricing.keys())
+        availability = self.ensure_iap_availability(iap_id, territories)
         price_points = self._fetch_price_points_paginated(
             f"/v2/inAppPurchases/{iap_id}/pricePoints",
             territories=territories,
@@ -1596,7 +1628,11 @@ class AppStoreConnectClient:
             })
 
         if not included:
-            return {"territories_set": 0, "territories_skipped": not_found}
+            return {
+                "territories_set": 0,
+                "territories_skipped": not_found,
+                "availability_created": availability["created"],
+            }
 
         self.request(
             "POST",
@@ -1617,7 +1653,11 @@ class AppStoreConnectClient:
                 "included": included,
             },
         )
-        return {"territories_set": len(included), "territories_skipped": not_found}
+        return {
+            "territories_set": len(included),
+            "territories_skipped": not_found,
+            "availability_created": availability["created"],
+        }
 
     def set_subscription_pricing(
         self,
@@ -1629,9 +1669,9 @@ class AppStoreConnectClient:
         *pricing* maps ``{territory_3letter: {currency, price}}``.
 
         Fetches available price points, snaps each requested price, then
-        creates or updates prices per territory.  For approved subscriptions
-        the initial price cannot be re-created, so we skip territories that
-        already have pricing and only add new ones.
+        creates or updates prices per territory.  Territories already at the
+        target price point are skipped; territories priced differently get a
+        new price posted (startDate=None — decreases apply immediately).
 
         Returns ``{"territories_set": int, "territories_skipped": [...], "already_set": int}``.
         """
@@ -1715,10 +1755,17 @@ class AppStoreConnectClient:
                 already_set += 1
                 continue
 
-            # For territories that already have pricing, skip — can't change initial price
-            if territory in existing_price_ids:
-                already_set += 1
-                continue
+            # Territories that already have a different price fall through to the
+            # POST below as a *scheduled* price change: Apple rejects a second
+            # startDate=None price ("Initial price cannot be created again"), so
+            # changes carry the earliest allowed startDate (tomorrow, UTC).
+            # Per-territory failures are collected rather than aborting the batch.
+            is_change = territory in existing_price_ids
+            start_date = (
+                (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+                if is_change
+                else None
+            )
 
             # When availability pre-existed we can only price territories it
             # already covers; pricing an unavailable territory would 409.
@@ -1737,7 +1784,7 @@ class AppStoreConnectClient:
                     json_body={
                         "data": {
                             "type": "subscriptionPrices",
-                            "attributes": {"startDate": None, "preserveCurrentPrice": False},
+                            "attributes": {"startDate": start_date, "preserveCurrentPrice": False},
                             "relationships": {
                                 "subscription": {
                                     "data": {"type": "subscriptions", "id": subscription_id},
@@ -1779,6 +1826,140 @@ class AppStoreConnectClient:
         if items:
             return items[0]["id"]
         return None
+
+    def create_in_app_purchase(
+        self,
+        app_id: str,
+        product_id: str,
+        name: str,
+        in_app_purchase_type: str,
+        *,
+        family_sharable: bool = False,
+        review_note: str | None = None,
+    ) -> str:
+        """Create a consumable, non-consumable, or non-renewing IAP."""
+        normalized_type = str(in_app_purchase_type).strip().upper()
+        aliases = {
+            "NONCONSUMABLE": "NON_CONSUMABLE",
+            "NONRENEWING_SUBSCRIPTION": "NON_RENEWING_SUBSCRIPTION",
+        }
+        normalized_type = aliases.get(normalized_type, normalized_type)
+        supported = {
+            "CONSUMABLE",
+            "NON_CONSUMABLE",
+            "NON_RENEWING_SUBSCRIPTION",
+        }
+        if normalized_type not in supported:
+            raise ValueError(
+                f"Unsupported App Store IAP type: {in_app_purchase_type!r}. "
+                f"Expected one of: {', '.join(sorted(supported))}."
+            )
+
+        attributes: Dict[str, Any] = {
+            "name": str(name)[:64],
+            "productId": product_id,
+            "inAppPurchaseType": normalized_type,
+            "familySharable": family_sharable,
+        }
+        if review_note is not None:
+            attributes["reviewNote"] = review_note
+        data = self.request(
+            "POST",
+            "/v2/inAppPurchases",
+            json_body={
+                "data": {
+                    "type": "inAppPurchases",
+                    "attributes": attributes,
+                    "relationships": {
+                        "app": {"data": {"type": "apps", "id": app_id}},
+                    },
+                },
+            },
+        )
+        return data.get("data", {}).get("id", "")
+
+    def get_iap_availability(self, iap_id: str) -> Dict[str, Any] | None:
+        """Return an IAP's availability, or ``None`` when it is unset."""
+        try:
+            data = self.request(
+                "GET",
+                f"/v2/inAppPurchases/{iap_id}/inAppPurchaseAvailability",
+            )
+        except RuntimeError as exc:
+            if "404" in str(exc):
+                return None
+            raise
+
+        availability = data.get("data", {})
+        availability_id = availability.get("id") or iap_id
+        territories: set[str] = set()
+        base_domain = self.base_url.rsplit("/v", 1)[0]
+        next_path: str | None = (
+            f"/v1/inAppPurchaseAvailabilities/{availability_id}/availableTerritories"
+        )
+        next_params: Dict[str, str] | None = {"limit": "200"}
+        while next_path:
+            response = self.request("GET", next_path, params=next_params)
+            territories.update(
+                item["id"] for item in response.get("data", []) if item.get("id")
+            )
+            next_link = response.get("links", {}).get("next")
+            if (
+                next_link
+                and isinstance(next_link, str)
+                and next_link.startswith(base_domain)
+            ):
+                next_path = next_link[len(base_domain):]
+                next_params = None
+            else:
+                next_path = None
+        return {
+            "available_in_new_territories": availability
+            .get("attributes", {})
+            .get("availableInNewTerritories", True),
+            "territories": territories,
+        }
+
+    def ensure_iap_availability(
+        self,
+        iap_id: str,
+        territories: Sequence[str],
+        *,
+        available_in_new_territories: bool = True,
+    ) -> Dict[str, Any]:
+        """Create IAP territory availability when none exists."""
+        existing = self.get_iap_availability(iap_id)
+        if existing is not None:
+            return {
+                "created": False,
+                "available_territories": existing["territories"],
+            }
+
+        wanted = [territory for territory in dict.fromkeys(territories) if territory]
+        self.request(
+            "POST",
+            "/v1/inAppPurchaseAvailabilities",
+            json_body={
+                "data": {
+                    "type": "inAppPurchaseAvailabilities",
+                    "attributes": {
+                        "availableInNewTerritories": available_in_new_territories,
+                    },
+                    "relationships": {
+                        "availableTerritories": {
+                            "data": [
+                                {"type": "territories", "id": territory}
+                                for territory in wanted
+                            ],
+                        },
+                        "inAppPurchase": {
+                            "data": {"type": "inAppPurchases", "id": iap_id},
+                        },
+                    },
+                },
+            },
+        )
+        return {"created": True, "available_territories": set(wanted)}
 
     def list_in_app_purchase_localizations(
         self, iap_id: str,
@@ -2254,6 +2435,8 @@ def push_listings(
     created_locales: List[str] = []
 
     for locale, fields in sorted(locales_data.items()):
+        created_info_loc = False
+
         # --- App Info localization (name, subtitle, privacy) ---
         if not only_whats_new:
             info_attrs: Dict[str, str | None] = {}
@@ -2270,6 +2453,7 @@ def push_listings(
                     client.update_app_info_localization(existing["id"], **info_attrs)
                 else:
                     client.create_app_info_localization(app_info_id, locale, **info_attrs)
+                    created_info_loc = True
 
         # --- Version localization (description, keywords, promo, whatsNew) ---
         ver_attrs: Dict[str, str | None] = {}
@@ -2292,14 +2476,35 @@ def push_listings(
 
         if ver_attrs:
             existing = existing_version.get(locale)
-            if existing and existing.get("id"):
-                client.update_app_store_version_localization(existing["id"], **ver_attrs)
-                updated_locales.append(locale)
+            loc_id = existing["id"] if (existing and existing.get("id")) else None
+            in_snapshot = loc_id is not None
+
+            # Creating a new app-info localization makes App Store Connect
+            # auto-create the matching version localization. That happens after
+            # the snapshot above was taken, so look it up live and PATCH the
+            # shell rather than POSTing a duplicate (a 409 that aborts the push).
+            if loc_id is None and created_info_loc:
+                loc_id = client.find_app_store_version_localization(version_id, locale)
+
+            if loc_id is not None:
+                client.update_app_store_version_localization(loc_id, **ver_attrs)
             else:
-                client.create_app_store_version_localization(
-                    version_id, locale, **ver_attrs,
-                )
-                created_locales.append(locale)
+                try:
+                    client.create_app_store_version_localization(
+                        version_id, locale, **ver_attrs,
+                    )
+                except RuntimeError as exc:
+                    # Defensive: if the version localization was auto-created
+                    # (or created by a prior interrupted run) between our checks
+                    # and now, adopt and update it instead of failing.
+                    if "already exists" not in str(exc):
+                        raise
+                    loc_id = client.find_app_store_version_localization(version_id, locale)
+                    if loc_id is None:
+                        raise
+                    client.update_app_store_version_localization(loc_id, **ver_attrs)
+
+            (updated_locales if in_snapshot else created_locales).append(locale)
 
     return {"ok": True, "updated_locales": updated_locales, "created_locales": created_locales}
 
@@ -2642,21 +2847,26 @@ def sync_iap_localizations(
     When *delete_missing* is True, remote localizations not present in the
     local list are deleted from App Store Connect.
 
-    Returns ``{"ok": True, "created": int, "updated": int, "deleted": int, "missing_products": [...]}``.
+    Missing products are created when their config includes ``type``. Returns
+    ``{"ok": True, "created": int, "updated": int, "deleted": int,
+    "created_products": [...], "missing_products": [...]}``.
     """
     created_count = 0
     updated_count = 0
     deleted_count = 0
     missing: List[str] = []
+    created_products: List[str] = []
 
     for product in products:
         product_id = product["product_id"]
         localizations = product.get("localizations", {})
 
-        iap_id = client.find_in_app_purchase_id(app_id, product_id)
+        iap_id, was_created = ensure_iap_exists(client, app_id, product)
         if iap_id is None:
             missing.append(product_id)
             continue
+        if was_created:
+            created_products.append(product_id)
 
         existing = client.list_in_app_purchase_localizations(iap_id)
 
@@ -2687,8 +2897,44 @@ def sync_iap_localizations(
         "created": created_count,
         "updated": updated_count,
         "deleted": deleted_count,
+        "created_products": created_products,
         "missing_products": missing,
     }
+
+
+def ensure_iap_exists(
+    client: AppStoreConnectClient,
+    app_id: str,
+    product: Dict[str, Any],
+) -> tuple[str | None, bool]:
+    """Find an IAP by product id, creating it when ``type`` is configured."""
+    product_id = product.get("product_id", "")
+    iap_id = client.find_in_app_purchase_id(app_id, product_id)
+    if iap_id is not None:
+        return iap_id, False
+
+    product_type = product.get("type") or product.get("in_app_purchase_type")
+    if not product_type:
+        return None, False
+
+    name = product.get("name")
+    if not name:
+        localizations = product.get("localizations", {}) or {}
+        chosen = (
+            localizations.get("en-US")
+            or (next(iter(localizations.values()), {}) if localizations else {})
+        )
+        name = (chosen or {}).get("name") or product_id.rsplit(".", 1)[-1]
+
+    new_id = client.create_in_app_purchase(
+        app_id,
+        product_id,
+        str(name),
+        str(product_type),
+        family_sharable=bool(product.get("family_sharable", False)),
+        review_note=product.get("review_note"),
+    )
+    return new_id, True
 
 
 def ensure_subscription_exists(
@@ -2851,7 +3097,7 @@ def sync_iap_pricing(
         if not pricing:
             continue
 
-        iap_id = client.find_in_app_purchase_id(app_id, product_id)
+        iap_id, _ = ensure_iap_exists(client, app_id, product)
         if iap_id is None:
             missing.append(product_id)
             continue
